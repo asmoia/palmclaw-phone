@@ -56,10 +56,13 @@ class DuckProvider(
          *  with 429 ERR_INPUT_LIMIT (validated: ~8-11k chars pass, 20k fails). */
         private const val MAX_TOTAL_CHARS = 9000
 
-        // Layer 3 — OpenAI-compatible fallback (user's own Cloudflare Worker).
-        // Native tool calling; swap these constants if the endpoint changes.
-        private const val FALLBACK_BASE_URL =
-            "https://palmclaw-ai.heminacearbi.workers.dev/v1/chat/completions"
+        // Layer 3 — OpenAI-compatible fallback (user's own Cloudflare Workers,
+        // two independent accounts; each resets its 10k free neurons at 00:00 UTC).
+        // Native tool calling; tried in order until one succeeds.
+        private val FALLBACK_URLS = listOf(
+            "https://palmclaw-ai.heminacearbi.workers.dev/v1/chat/completions",
+            "https://palmclaw-ai.canivashaadi.workers.dev/v1/chat/completions"
+        )
         private const val FALLBACK_API_KEY = "sk-palmclaw-9k2m4xq7tv"
         private const val FALLBACK_MODEL = "llama-3.3-70b"
 
@@ -206,6 +209,19 @@ class DuckProvider(
 
     private fun fallbackChat(messages: List<ChatMessage>, toolsSpec: List<ToolSpec>): LlmResponse? {
         val ok = client ?: return null
+        // Try both Workers (independent accounts/quotas) until one succeeds.
+        for (attempt in FALLBACK_URLS.indices) {
+            fallbackChatOnce(ok, messages, toolsSpec, attempt)?.let { return it }
+        }
+        return null
+    }
+
+    private fun fallbackChatOnce(
+        ok: OkHttpClient,
+        messages: List<ChatMessage>,
+        toolsSpec: List<ToolSpec>,
+        endpointIndex: Int
+    ): LlmResponse? {
         val body = JSONObject().apply {
             put("model", FALLBACK_MODEL)
             put("temperature", 0.2)
@@ -223,7 +239,7 @@ class DuckProvider(
             }
         }
         val req = Request.Builder()
-            .url(FALLBACK_BASE_URL)
+            .url(FALLBACK_URLS[endpointIndex % FALLBACK_URLS.size])
             .addHeader("Authorization", "Bearer $FALLBACK_API_KEY")
             .addHeader("Content-Type", "application/json")
             .post(body.toString().toRequestBody("application/json".toMediaType()))
