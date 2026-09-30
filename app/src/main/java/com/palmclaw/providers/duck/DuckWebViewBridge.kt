@@ -9,6 +9,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.getCompletionExceptionOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
@@ -75,10 +76,10 @@ object DuckWebViewBridge {
 
     private fun ensureReady(): CompletableDeferred<Unit> {
         val existing = readyLock
-        if (existing != null && !existing.isCompletedExceptionally) return existing
+        if (existing != null && existing.getCompletionExceptionOrNull() == null) return existing
         synchronized(this) {
             val again = readyLock
-            if (again != null && !again.isCompletedExceptionally) return again
+            if (again != null && again.getCompletionExceptionOrNull() == null) return again
             val latch = CompletableDeferred<Unit>()
             readyLock = latch
             val ctx = appContext

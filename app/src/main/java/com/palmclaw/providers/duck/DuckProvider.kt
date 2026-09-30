@@ -126,7 +126,7 @@ class DuckProvider(
 
     // ── Layer 1 + 2: duck with retries ───────────────────────────────────────
 
-    private fun duckChatWithRetries(messages: List<ChatMessage>, toolsSpec: List<ToolSpec>): LlmResponse? {
+    private suspend fun duckChatWithRetries(messages: List<ChatMessage>, toolsSpec: List<ToolSpec>): LlmResponse? {
         // Ladder: shrink history window AND total char budget on context errors.
         val budgets = intArrayOf(MAX_TOTAL_CHARS, 6000, 4000, 2500)
         var bestPlainAnswer: LlmResponse? = null
@@ -174,7 +174,7 @@ class DuckProvider(
     @Volatile private var lastDuckError: String? = null
 
     /** Layer 2 — one corrective turn after a refusal. Returns parsed response or null. */
-    private fun escalate(
+    private suspend fun escalate(
         instructions: String,
         wireMessagesSoFar: JSONArray,
         originalMessages: List<ChatMessage>,
@@ -232,7 +232,7 @@ class DuckProvider(
             ok.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@runCatching null
                 val parsed = JSONObject(resp.body?.string() ?: return@runCatching null)
-                val msg = parsed.getJSONObject("choices").getJSONObject(0).getJSONObject("message")
+                val msg = parsed.getJSONArray("choices").getJSONObject(0).getJSONObject("message")
                 val toolCalls = mutableListOf<ToolCall>()
                 msg.optJSONArray("tool_calls")?.let { arr ->
                     for (i in 0 until arr.length()) {
