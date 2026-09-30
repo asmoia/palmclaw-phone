@@ -1,0 +1,1444 @@
+package com.palmclaw.runtime
+
+import android.app.Application
+import android.util.Log
+import com.palmclaw.attachments.AttachmentTransferService
+import com.palmclaw.agent.AgentLoop
+import com.palmclaw.agent.ContextBuilder
+import com.palmclaw.agent.MemoryConsolidator
+import com.palmclaw.agent.SubagentManager
+import com.palmclaw.agent.ToolCallParser
+import com.palmclaw.bus.InboundMessage
+import com.palmclaw.bus.MessageAttachment
+import com.palmclaw.bus.MessageAttachmentJsonCodec
+import com.palmclaw.bus.MessageAttachmentTransferState
+import com.palmclaw.bus.MessageBus
+import com.palmclaw.bus.OutboundMessage
+import com.palmclaw.channels.ChannelAdapterIdentity
+import com.palmclaw.channels.ChannelBindingRuntimeProjector
+import com.palmclaw.channels.ChannelGatewayLifecycle
+import com.palmclaw.channels.ChannelRuntimeSnapshotSource
+import com.palmclaw.channels.ConfiguredChannelAdapterFactory
+import com.palmclaw.channels.EmailAddressValidator
+import com.palmclaw.channels.GatewayOrchestrator
+import com.palmclaw.channels.GatewayOrchestratorFactory
+import com.palmclaw.config.AppConfig
+import com.palmclaw.config.AppLimits
+import com.palmclaw.config.AppSession
+import com.palmclaw.config.ChannelsConfig
+import com.palmclaw.config.ConfigStore
+import com.palmclaw.config.CronConfig
+import com.palmclaw.config.HeartbeatConfig
+import com.palmclaw.config.HeartbeatDoc
+import com.palmclaw.config.SessionChannelBinding
+import com.palmclaw.cron.CronExecutionPromptBuilder
+import com.palmclaw.cron.CronJob
+import com.palmclaw.cron.CronLogStore
+import com.palmclaw.cron.CronRepository
+import com.palmclaw.cron.CronService
+import com.palmclaw.heartbeat.HeartbeatService
+import com.palmclaw.memory.MemoryStore
+import com.palmclaw.mcp.DefaultMcpRuntimeLifecycle
+import com.palmclaw.mcp.McpNetworkAvailability
+import com.palmclaw.mcp.McpRuntimeSnapshot
+import com.palmclaw.mcp.McpServerPhase
+import com.palmclaw.mcp.McpServerSnapshot
+import com.palmclaw.mcp.transport.McpTransportClientFactory
+import com.palmclaw.providers.ChatMessage
+import com.palmclaw.providers.LlmProviderFactory
+import com.palmclaw.runtime.automation.AutomationRuntimeLifecycle
+import com.palmclaw.runtime.control.RuntimeControlOperations
+import com.palmclaw.runtime.control.ActiveSessionSource
+import com.palmclaw.runtime.control.HeartbeatRuntimePort
+import com.palmclaw.runtime.control.McpRuntimeStatus
+import com.palmclaw.runtime.control.McpRuntimeStatusIssue
+import com.palmclaw.runtime.control.McpRuntimeStatusSnapshot
+import com.palmclaw.runtime.control.McpRuntimeStatusSource
+import com.palmclaw.runtime.control.RuntimeRefreshPort
+import com.palmclaw.runtime.control.RuntimeToolIntegration
+import com.palmclaw.runtime.control.SessionDeliveryPort
+import com.palmclaw.providers.ToolSpec
+import com.palmclaw.skills.SkillsLoader
+import com.palmclaw.agent.AgentLogStore
+import com.palmclaw.storage.AppDatabase
+import com.palmclaw.storage.MessageRepository
+import com.palmclaw.storage.SessionRepository
+import com.palmclaw.storage.entities.SessionEntity
+import com.palmclaw.templates.TemplateStore
+import com.palmclaw.tools.CronConfigUpdate
+import com.palmclaw.tools.MessageTool
+import com.palmclaw.tools.SpawnTool
+import com.palmclaw.tools.Tool
+import com.palmclaw.tools.ToolRegistry
+import com.palmclaw.tools.BuiltInToolCatalog
+import com.palmclaw.tools.SearchProviderRuntimeConfig
+import com.palmclaw.tools.buildCoreTools
+import com.palmclaw.tools.createCronToolSet
+import com.palmclaw.workspace.SessionWorkspaceManager
+import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import org.json.JSONObject
+import java.util.Locale
+
+data class GatewayRuntimeState(
+    val gatewayRunning: Boolean = false,
+    val activeAdapterCount: Int = 0,
+    val lastError: String = "",
+    val processingSessionIds: Set<String> = emptySet(),
+    val mcpSnapshot: McpRuntimeSnapshot = McpRuntimeSnapshot()
+)
+
+data class GatewayRuntimeDependencies internal constructor(
+    val storageMigration: Unit,
+    val database: AppDatabase,
+    val messageRepository: MessageRepository,
+    val sessionRepository: SessionRepository,
+    val memoryStore: MemoryStore,
+    val cronRepository: CronRepository,
+    val cronService: CronService,
+    val cronLogStore: CronLogStore,
+    val agentLogStore: AgentLogStore,
+    val configStore: ConfigStore,
+    val skillsLoader: SkillsLoader,
+    val templateStore: TemplateStore,
+    val heartbeatDocFile: File,
+    val heartbeatService: HeartbeatService,
+    val workspaceManager: SessionWorkspaceManager,
+    val attachmentTransferService: AttachmentTransferService,
+    internal val runtimeControlOperations: RuntimeControlOperations,
+    val channelBindingRuntimeProjector: ChannelBindingRuntimeProjector,
+    val channelRuntimeSnapshotSource: ChannelRuntimeSnapshotSource,
+    val emailAddressValidator: EmailAddressValidator,
+    val mcpTransportClientFactory: McpTransportClientFactory,
+    val mcpNetworkAvailability: McpNetworkAvailability
+)
+
+class GatewayRuntime(
+    private val app: Application,
+    private val enableAutomation: Boolean = true,
+    private val enableMcp: Boolean = true,
+    private val onStateChanged: (GatewayRuntimeState) -> Unit = {},
+    dependencies: GatewayRuntimeDependencies
+) {
+    private val storageMigration: Unit = dependencies.storageMigration
+    private val database = dependencies.database
+    private val messageRepository = dependencies.messageRepository
+    private val sessionRepository = dependencies.sessionRepository
+    private val memoryStore = dependencies.memoryStore
+    private val cronRepository = dependencies.cronRepository
+    private val cronService = dependencies.cronService
+    private val cronLogStore = dependencies.cronLogStore
+    private val agentLogStore = dependencies.agentLogStore
+    private val configStore = dependencies.configStore
+    private val providerFactory = LlmProviderFactory()
+    private val skillsLoader = dependencies.skillsLoader
+    private val templateStore = dependencies.templateStore
+    private val toolCallParser = ToolCallParser()
+    private val heartbeatDocFile = dependencies.heartbeatDocFile
+    private val heartbeatService = dependencies.heartbeatService
+    private val automationRuntimeLifecycle = if (enableAutomation) {
+        AutomationRuntimeLifecycle(
+            cronService = cronService,
+            heartbeatService = heartbeatService,
+            onCronJob = ::executeCronJob,
+            onCronLog = cronLogStore::append
+        )
+    } else {
+        null
+    }
+    private val workspaceManager = dependencies.workspaceManager
+    private val attachmentTransferService = dependencies.attachmentTransferService
+    private val channelBindingRuntimeProjector = dependencies.channelBindingRuntimeProjector
+    private val channelRuntimeSnapshotSource = dependencies.channelRuntimeSnapshotSource
+    private val emailAddressValidator = dependencies.emailAddressValidator
+    private val runtimeScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val sessionTurnCoordinator = SessionTurnCoordinator()
+    private val json = Json { ignoreUnknownKeys = true }
+
+    private val coreBuiltInTools = buildCoreTools(
+        context = app,
+        memoryStore = memoryStore,
+        currentSessionIdProvider = {
+            AgentLoop.currentSessionId()
+                ?.trim()
+                ?.ifBlank { null }
+                ?: AppSession.LOCAL_SESSION_ID
+        },
+        sessionWorkspaceManager = workspaceManager,
+        searchSettingsProvider = {
+            val config = configStore.getConfig()
+            SearchProviderRuntimeConfig(
+                providerId = config.searchProvider,
+                configs = config.searchProviderConfigs
+            )
+        }
+    )
+    private val cronBuiltInTools = if (enableAutomation) {
+        createCronToolSet(
+            cronService,
+            onSetServiceEnabled = { enabled -> setCronEnabledFromTool(enabled) },
+            onUpdateConfig = { update -> persistCronSettings(update) }
+        )
+    } else {
+        emptyList()
+    }
+    private val toolRegistry = ToolRegistry(
+        initialTools = initialEnabledTools().associateBy { it.name },
+        timeoutMsProvider = {
+            configStore.getConfig().defaultToolTimeoutSeconds
+                .coerceIn(AppLimits.MIN_TOOL_TIMEOUT_SECONDS, AppLimits.MAX_TOOL_TIMEOUT_SECONDS)
+                .toLong() * 1000L
+        }
+    )
+    private val mcpRuntimeLifecycle = if (enableMcp) {
+        DefaultMcpRuntimeLifecycle(
+            transportFactory = dependencies.mcpTransportClientFactory,
+            toolRegistry = toolRegistry,
+            parentScope = runtimeScope,
+            networkAvailability = dependencies.mcpNetworkAvailability
+        )
+    } else {
+        null
+    }
+    private val mcpReloadLock = Any()
+    private var mcpReloadJob: Job? = null
+    private val messageTool = coreBuiltInTools.firstOrNull { it.name == "message" } as? MessageTool
+    private var spawnTool: SpawnTool? = null
+    private var subagentManager: SubagentManager? = null
+    private val remoteDeliveryTurnLock = Any()
+    private val remoteDeliveryTurns = mutableMapOf<String, Boolean>()
+
+    private val memoryConsolidator = MemoryConsolidator(
+        repository = messageRepository,
+        memoryStore = memoryStore,
+        providerFactory = { providerFactory.create(configStore.getConfig()) },
+        toolCallParser = toolCallParser
+    )
+    private val agentLoop = AgentLoop(
+        repository = messageRepository,
+        contextBuilder = ContextBuilder(
+            workspaceContextProvider = ::buildWorkspaceContext
+        ),
+        toolCallParser = toolCallParser,
+        toolRegistry = toolRegistry,
+        llmProviderFactory = { providerFactory.create(configStore.getConfig()) },
+        memoryStore = memoryStore,
+        memoryConsolidator = memoryConsolidator,
+        skillsLoader = skillsLoader,
+        templateStore = templateStore,
+        processLogger = { line -> agentLogStore.append(line) },
+        usageReporter = { usage -> configStore.recordTokenUsage(usage) },
+        maxRoundsProvider = { configStore.getConfig().maxToolRounds },
+        toolResultMaxCharsProvider = { configStore.getConfig().toolResultMaxChars },
+        memoryWindowProvider = { configStore.getConfig().memoryConsolidationWindow },
+        maxContextMessagesProvider = { configStore.getConfig().contextMessages }
+    )
+    private val gatewayBus = MessageBus()
+    private val channelGatewayLifecycle = ChannelGatewayLifecycle(
+        adapterFactory = ConfiguredChannelAdapterFactory(app),
+        orchestratorFactory = GatewayOrchestratorFactory { adapters ->
+            GatewayOrchestrator(
+                bus = gatewayBus,
+                agentLoop = agentLoop,
+                messageRepository = messageRepository,
+                sessionRepository = sessionRepository,
+                attachmentTransferService = attachmentTransferService,
+                sessionResolver = { inbound -> resolveGatewaySessionBinding(inbound) },
+                onSessionProcessingChanged = { sessionId, processing ->
+                    onGatewaySessionProcessingChanged(sessionId, processing)
+                },
+                onRemoteDeliveryTurnStarted = ::startRemoteDeliveryTurn,
+                onRemoteDeliveryTurnFinished = ::finishRemoteDeliveryTurn,
+                wasRemoteDeliverySentInTurn = ::wasRemoteDeliverySentInTurn,
+                messageTool = messageTool,
+                spawnTool = spawnTool,
+                withAgentTurnLock = { sessionId, block ->
+                    sessionTurnCoordinator.withSessionTurn(normalizeSessionId(sessionId)) { block() }
+                },
+                adapters = adapters
+            )
+        },
+        onStateChanged = { snapshot ->
+            updateState(
+                gatewayRunning = snapshot.running,
+                activeAdapterCount = snapshot.adapterCount,
+                lastError = snapshot.lastError
+            )
+        }
+    )
+    private val gatewayProcessingSessions = mutableSetOf<String>()
+    private val runtimeStateLock = Any()
+    @Volatile
+    private var runtimeState = GatewayRuntimeState()
+    @Volatile
+    private var pendingGatewayConfig: ChannelsConfig? = null
+    @Volatile
+    private var pendingGatewayStop: Boolean = false
+    private val runtimeToolIntegration = RuntimeToolIntegration(
+        operations = dependencies.runtimeControlOperations,
+        includeHeartbeat = enableAutomation,
+        refreshPort = object : RuntimeRefreshPort {
+            override fun applyHeartbeatConfig(config: HeartbeatConfig) {
+                automationRuntimeLifecycle?.applyHeartbeatConfig(config)
+            }
+
+            override fun applyChannelsConfig(config: ChannelsConfig) {
+                requestGatewayRuntimeConfig(config)
+            }
+        },
+        heartbeatPort = object : HeartbeatRuntimePort {
+            override fun armNextAlarm(config: HeartbeatConfig, timestampMs: Long) {
+                automationRuntimeLifecycle?.armNextHeartbeatAlarm(timestampMs)
+            }
+
+            override suspend fun triggerNow(): String =
+                processHeartbeatTick() ?: "Heartbeat completed with no action."
+        },
+        activeSessionSource = ActiveSessionSource {
+            AgentLoop.currentSessionId()
+                ?.trim()
+                ?.ifBlank { null }
+                ?: AppSession.LOCAL_SESSION_ID
+        },
+        sessionDeliveryPort = object : SessionDeliveryPort {
+            override suspend fun prepareAttachments(
+                sessionId: String,
+                sessionTitle: String,
+                messageId: Long,
+                attachments: List<MessageAttachment>
+            ): List<MessageAttachment> = attachmentTransferService.prepareAssistantAttachments(
+                sessionId = sessionId,
+                sessionTitle = sessionTitle,
+                messageId = messageId,
+                attachments = attachments
+            )
+
+            override fun resolveActiveBinding(sessionId: String): SessionChannelBinding? =
+                findSessionChannelBinding(sessionId)
+
+            override fun supportsRemoteDelivery(outbound: OutboundMessage): Boolean =
+                isRemoteAttachmentDeliverySupported(outbound)
+
+            override suspend fun deliver(outbound: OutboundMessage) {
+                deliverOutboundViaOwnedGateway(outbound)
+            }
+
+            override fun markRemoteDeliverySent() {
+                markCurrentRemoteDeliveryTurnSent()
+            }
+
+            override fun adapterMetadata(binding: SessionChannelBinding): Map<String, String> =
+                buildAdapterMetadata(ChannelAdapterIdentity.primaryKeyForBinding(binding))
+        },
+        channelSnapshotSource = channelRuntimeSnapshotSource,
+        mcpStatusSource = object : McpRuntimeStatusSource {
+            override fun currentStatuses(): Map<String, McpRuntimeStatus> =
+                currentSnapshot()?.statuses.orEmpty()
+
+            override fun currentSnapshot(): McpRuntimeStatusSnapshot? {
+                val snapshot = mcpRuntimeLifecycle?.snapshot?.value ?: return null
+                return McpRuntimeStatusSnapshot(
+                    enabled = snapshot.enabled,
+                    generation = snapshot.generation,
+                    statuses = buildMap {
+                        snapshot.servers.forEach { server ->
+                            val status = server.toRuntimeMcpStatus()
+                            put(server.serverId, status)
+                            putIfAbsent(server.serverName, status)
+                        }
+                    },
+                    issues = snapshot.issues.map { issue ->
+                        McpRuntimeStatusIssue(
+                            code = issue.code,
+                            detail = issue.detail
+                        )
+                    }
+                )
+            }
+        }
+    )
+
+    init {
+        storageMigration
+        configureMessageTool()
+        runtimeToolIntegration.tools.forEach(::syncManagedTool)
+        configureSpawnTool()
+        automationRuntimeLifecycle?.start(
+            cronConfig = configStore.getCronConfig(),
+            heartbeatConfig = configStore.getHeartbeatConfig()
+        )
+        mcpRuntimeLifecycle?.let { lifecycle ->
+            runtimeScope.launch {
+                lifecycle.snapshot.collect { snapshot ->
+                    updateState(mcpSnapshot = snapshot)
+                }
+            }
+        }
+    }
+
+    fun start() {
+        runtimeScope.launch {
+            runCatching { ensureLocalSessionWorkspace() }
+                .onFailure { t -> Log.e(TAG, "Failed to bootstrap local session workspace", t) }
+        }
+        reloadAutomationFromStoredConfig()
+        reloadMcpFromStoredConfig()
+    }
+
+    private fun initialEnabledTools(): List<Tool> {
+        val config = configStore.getConfig()
+        return (coreBuiltInTools + cronBuiltInTools)
+            .filter { BuiltInToolCatalog.isEnabled(config, it.name) }
+    }
+
+    private fun syncBuiltInToolsFromStoredConfig() {
+        val config = configStore.getConfig()
+        syncManagedToolSet(coreBuiltInTools, config)
+        syncManagedToolSet(cronBuiltInTools, config)
+        syncManagedToolSet(runtimeToolIntegration.tools, config)
+        spawnTool?.let(::syncManagedTool)
+    }
+
+    private fun syncManagedToolSet(tools: List<Tool>, config: AppConfig) {
+        tools.forEach { tool ->
+            if (BuiltInToolCatalog.isEnabled(config, tool.name)) {
+                toolRegistry.register(tool)
+            } else {
+                toolRegistry.unregister(tool.name)
+            }
+        }
+    }
+
+    private fun syncManagedTool(tool: Tool) {
+        if (BuiltInToolCatalog.isEnabled(configStore.getConfig(), tool.name)) {
+            toolRegistry.register(tool)
+        } else {
+            toolRegistry.unregister(tool.name)
+        }
+    }
+
+    suspend fun deliverOutboundViaOwnedGateway(outbound: OutboundMessage) {
+        channelGatewayLifecycle.deliverOutbound(outbound)
+    }
+
+    fun reloadGatewayFromStoredConfig() {
+        syncBuiltInToolsFromStoredConfig()
+        requestGatewayRuntimeConfig(configStore.getChannelsConfig())
+    }
+
+    fun stopGateway() {
+        val shouldDefer = synchronized(gatewayProcessingSessions) {
+            if (gatewayProcessingSessions.isEmpty()) {
+                pendingGatewayConfig = null
+                pendingGatewayStop = false
+                false
+            } else {
+                pendingGatewayConfig = null
+                pendingGatewayStop = true
+                true
+            }
+        }
+        if (!shouldDefer) {
+            stopGatewayNow()
+        }
+    }
+
+    fun reloadAutomationFromStoredConfig() {
+        if (!enableAutomation) return
+        syncBuiltInToolsFromStoredConfig()
+        checkNotNull(automationRuntimeLifecycle).reload(
+            cronConfig = configStore.getCronConfig(),
+            heartbeatConfig = configStore.getHeartbeatConfig()
+        )
+    }
+
+    fun reloadMcpFromStoredConfig() {
+        if (!enableMcp) return
+        syncBuiltInToolsFromStoredConfig()
+        val lifecycle = checkNotNull(mcpRuntimeLifecycle)
+        val config = configStore.getMcpHttpConfig()
+        synchronized(mcpReloadLock) {
+            mcpReloadJob?.cancel()
+            mcpReloadJob = runtimeScope.launch {
+                try {
+                    val result = lifecycle.reconcile(config)
+                    if (!result.applied) {
+                        Log.w(TAG, "MCP configuration applied with unavailable servers")
+                    }
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    Log.e(TAG, "MCP configuration failed (${failure.javaClass.simpleName})")
+                }
+            }
+        }
+    }
+
+    fun reloadAllFromStoredConfig() {
+        reloadGatewayFromStoredConfig()
+        reloadAutomationFromStoredConfig()
+        reloadMcpFromStoredConfig()
+    }
+
+    suspend fun runUserMessage(
+        sessionId: String,
+        sessionTitle: String,
+        text: String,
+        attachments: List<MessageAttachment> = emptyList()
+    ) {
+        val normalizedSessionId = normalizeSessionId(sessionId)
+        val execution = executeAgentTurn(
+            AgentTurnRequest(
+                sessionId = normalizedSessionId,
+                sessionTitle = normalizedSessionTitle(normalizedSessionId, sessionTitle),
+                inputText = text,
+                inputAttachments = attachments,
+                deliveryMode = AgentTurnDeliveryMode.UseSessionBinding,
+                requireExistingSession = normalizedSessionId != AppSession.LOCAL_SESSION_ID
+            )
+        )
+        execution.throwIfFailed()
+        mirrorLatestAssistantToBoundChannel(
+            sessionId = execution.sessionId,
+            beforeAssistantId = execution.beforeLatestAssistantId,
+            binding = execution.binding,
+            messageSentInTurn = execution.messageSentInTurn
+        )
+    }
+
+    suspend fun triggerHeartbeatNow(): String {
+        if (!enableAutomation) {
+            throw IllegalStateException("Heartbeat automation is not enabled in this runtime")
+        }
+        if (!configStore.getHeartbeatConfig().enabled) {
+            throw IllegalStateException("Heartbeat is disabled")
+        }
+        return processHeartbeatTick() ?: "Heartbeat completed with no action."
+    }
+
+    suspend fun processHeartbeatTick(): String? {
+        if (!enableAutomation) {
+            throw IllegalStateException("Heartbeat automation is not enabled in this runtime")
+        }
+        configStore.saveHeartbeatLastTriggeredAtMs(System.currentTimeMillis())
+        val content = readHeartbeatDoc().trim()
+        if (content.isBlank()) return null
+
+        val parsed = parseHeartbeatTasks(content)
+        val tasks = if (parsed.hasActiveSection) {
+            parsed.tasks.trim().ifBlank { return null }
+        } else {
+            val decision = decideHeartbeat(content)
+            if (decision.action != HEARTBEAT_ACTION_RUN) return null
+            decision.tasks.trim().ifBlank { return null }
+        }
+
+        val execution = executeAgentTurn(
+            AgentTurnRequest(
+                sessionId = AppSession.SHARED_SESSION_ID,
+                sessionTitle = AppSession.SHARED_SESSION_TITLE,
+                inputText = tasks,
+                inputRole = "internal_user",
+                deliveryMode = AgentTurnDeliveryMode.LocalOnly
+            )
+        )
+        execution.throwIfFailed()
+        return execution.latestAssistantContentIfNew()?.trim().orEmpty().ifBlank { null }
+    }
+
+    suspend fun processDueCronJobs(resync: Boolean = false) {
+        if (!enableAutomation) {
+            throw IllegalStateException("Cron automation is not enabled in this runtime")
+        }
+        checkNotNull(automationRuntimeLifecycle).processDueCronJobs(resync)
+    }
+
+    fun shutdownRuntime() {
+        automationRuntimeLifecycle?.close()
+        messageTool?.clearSendCallback()
+        runtimeToolIntegration.close()
+        subagentManager?.close()
+        subagentManager = null
+        synchronized(mcpReloadLock) {
+            mcpReloadJob?.cancel()
+            mcpReloadJob = null
+        }
+        mcpRuntimeLifecycle?.close()
+        channelGatewayLifecycle.stop()
+        pendingGatewayConfig = null
+        updateState(gatewayRunning = false, activeAdapterCount = 0)
+        gatewayBus.close()
+        agentLoop.close()
+        runtimeScope.cancel()
+    }
+
+    private fun configureMessageTool() {
+        val tool = messageTool ?: return
+        tool.setSendCallback { outbound ->
+            if (!outbound.channel.equals("local", ignoreCase = true)) {
+                requireRemoteAttachmentDeliverySupported(outbound)
+            }
+            val transcriptSessionId = if (outbound.channel.equals("local", ignoreCase = true)) {
+                normalizeSessionId(outbound.chatId)
+            } else {
+                val activeSessionId = AgentLoop.currentSessionId()
+                    ?.trim()
+                    ?.ifBlank { null }
+                    ?: throw IllegalStateException("Remote message delivery requires an active agent session")
+                normalizeSessionId(activeSessionId)
+            }
+            val existingTranscriptSession = sessionRepository.getSession(transcriptSessionId)
+            val transcriptSession = existingTranscriptSession ?: SessionEntity(
+                id = transcriptSessionId,
+                title = if (transcriptSessionId == AppSession.LOCAL_SESSION_ID) {
+                    AppSession.LOCAL_SESSION_TITLE
+                } else {
+                    transcriptSessionId
+                },
+                createdAt = System.currentTimeMillis(),
+                updatedAt = System.currentTimeMillis()
+            )
+            if (existingTranscriptSession == null) {
+                sessionRepository.createSession(transcriptSession.id, transcriptSession.title)
+            }
+            val preparedAttachments = attachmentTransferService.prepareAssistantAttachments(
+                sessionId = transcriptSession.id,
+                sessionTitle = transcriptSession.title,
+                messageId = System.currentTimeMillis(),
+                attachments = outbound.normalizedAttachments
+            )
+            val failedAttachment = preparedAttachments.firstOrNull {
+                it.transferState == MessageAttachmentTransferState.Failed
+            }
+            if (failedAttachment != null) {
+                throw IllegalStateException(
+                    failedAttachment.failureMessage ?: "Attachment prepare failed: ${failedAttachment.label}"
+                )
+            }
+            if (outbound.normalizedAttachments.isNotEmpty() && preparedAttachments.isEmpty()) {
+                throw IllegalStateException("Attachment prepare failed: no readable attachments")
+            }
+            messageRepository.appendAssistantMessage(
+                sessionId = transcriptSession.id,
+                content = outbound.content,
+                attachments = preparedAttachments
+            )
+            sessionRepository.touch(transcriptSession.id)
+            if (!outbound.channel.equals("local", ignoreCase = true)) {
+                deliverOutboundViaOwnedGateway(outbound.copy(attachments = preparedAttachments))
+            }
+        }
+    }
+
+    private fun configureSpawnTool() {
+        val manager = SubagentManager(
+            agentLoop = agentLoop,
+            messageRepository = messageRepository,
+            sessionRepository = sessionRepository,
+            workspaceManager = workspaceManager,
+            publishOutbound = { outbound ->
+                deliverOutboundViaOwnedGateway(outbound)
+            }
+        )
+        val tool = SpawnTool(manager)
+        subagentManager = manager
+        spawnTool = tool
+        syncManagedTool(tool)
+    }
+
+    private fun isRemoteAttachmentDeliverySupported(outbound: OutboundMessage): Boolean {
+        if (outbound.normalizedAttachments.isEmpty()) return true
+        val capability = channelGatewayLifecycle.resolveOutboundAttachmentCapability(outbound)
+        return capability?.supportsOutboundFiles != false
+    }
+
+    private fun requireRemoteAttachmentDeliverySupported(outbound: OutboundMessage) {
+        if (!isRemoteAttachmentDeliverySupported(outbound)) {
+            throw IllegalStateException(
+                "${outbound.channel} does not support remote file delivery in the current adapter mode"
+            )
+        }
+    }
+
+    private fun buildAdapterMetadata(adapterKey: String?): Map<String, String> {
+        val normalized = adapterKey?.trim()?.ifBlank { null } ?: return emptyMap()
+        return mapOf(GatewayOrchestrator.KEY_ADAPTER_KEY to normalized)
+    }
+
+    private suspend fun executeCronJob(job: CronJob): String? {
+        val target = resolveCronTargetSession(job.payload.sessionId)
+        val targetSessionId = target.id
+        val targetTitle = target.title
+        val execution = executeAgentTurn(
+            AgentTurnRequest(
+                sessionId = targetSessionId,
+                sessionTitle = targetTitle,
+                inputText = CronExecutionPromptBuilder.build(job),
+                inputRole = "internal_user",
+                deliveryMode = if (job.payload.deliver) {
+                    AgentTurnDeliveryMode.UseSessionBinding
+                } else {
+                    AgentTurnDeliveryMode.LocalOnly
+                }
+            )
+        )
+        val runFailure = execution.failure
+        if (runFailure != null) {
+            Log.w(TAG, "cron onJob agent run failed", runFailure)
+        }
+        var response: String? = execution.latestAssistantContentIfNew()
+
+        if (response.isNullOrBlank()) {
+            val fallback = buildString {
+                append("Scheduled reminder: ")
+                append(job.payload.message.trim())
+                runFailure?.message?.takeIf { it.isNotBlank() }?.let {
+                    append("\n\nAgent error: ")
+                    append(it)
+                }
+            }
+            messageRepository.appendAssistantMessage(targetSessionId, fallback)
+            response = fallback
+        }
+
+        if (job.payload.deliver) {
+            runCatching {
+                mirrorLatestAssistantToBoundChannel(
+                    sessionId = execution.sessionId,
+                    beforeAssistantId = execution.beforeLatestAssistantId,
+                    binding = execution.binding,
+                    messageSentInTurn = execution.messageSentInTurn
+                )
+            }.onFailure { t ->
+                Log.w(TAG, "cron remote mirror failed", t)
+            }
+        }
+        return response
+    }
+
+    private suspend fun resolveCronTargetSession(requestedSessionId: String?): SessionTarget {
+        val requestedId = requestedSessionId?.trim().orEmpty()
+        val sessions = sessionRepository.listSessions()
+        val existing = sessions.firstOrNull { it.id == requestedId }
+        if (existing != null) {
+            return SessionTarget(id = existing.id, title = existing.title)
+        }
+        if (requestedId.isNotBlank() && requestedId != AppSession.LOCAL_SESSION_ID) {
+            Log.w(TAG, "Cron target session missing; falling back to local session requested=$requestedId")
+        }
+        val local = sessions.firstOrNull { it.id == AppSession.LOCAL_SESSION_ID }
+        return SessionTarget(
+            id = local?.id ?: AppSession.LOCAL_SESSION_ID,
+            title = local?.title ?: AppSession.LOCAL_SESSION_TITLE
+        )
+    }
+
+    private suspend fun prepareLocalMessageToolTurn(sessionId: String) {
+        val sid = sessionId.trim().ifBlank { AppSession.LOCAL_SESSION_ID }
+        messageTool?.startTurnWithContext(channel = "local", chatId = sid)
+        spawnTool?.startTurnWithContext(channel = "local", chatId = sid, sessionKey = sid)
+    }
+
+    private suspend fun prepareMessageToolTurnForSession(sessionId: String): SessionChannelBinding? {
+        val binding = findSessionChannelBinding(sessionId)
+        if (binding == null) {
+            prepareLocalMessageToolTurn(sessionId)
+            return null
+        }
+        val adapterKey = ChannelAdapterIdentity.primaryKeyForBinding(binding)
+        messageTool?.startTurnWithContext(
+            channel = binding.channel,
+            chatId = binding.chatId,
+            adapterKey = adapterKey
+        )
+        spawnTool?.startTurnWithContext(
+            channel = binding.channel,
+            chatId = binding.chatId,
+            sessionKey = sessionId,
+            adapterKey = adapterKey
+        )
+        return binding
+    }
+
+    private suspend fun mirrorLatestAssistantToBoundChannel(
+        sessionId: String,
+        beforeAssistantId: Long,
+        binding: SessionChannelBinding?,
+        messageSentInTurn: Boolean = false
+    ) {
+        if (binding == null) return
+        if (messageSentInTurn || messageTool?.wasSentInCurrentTurn() == true) return
+        val latest = messageRepository.getLatestAssistantMessage(sessionId) ?: return
+        if (latest.id <= beforeAssistantId) return
+        val text = latest.content.trim()
+        val attachments = MessageAttachmentJsonCodec.decode(latest.attachmentsJson)
+        if ((text.isBlank() || text == "[tool call]") && attachments.isEmpty()) return
+        val outbound = OutboundMessage(
+            channel = binding.channel,
+            chatId = binding.chatId,
+            content = text,
+            attachments = attachments,
+            metadata = buildAdapterMetadata(ChannelAdapterIdentity.primaryKeyForBinding(binding))
+        )
+        if (!isRemoteAttachmentDeliverySupported(outbound)) {
+            Log.w(
+                TAG,
+                "Skip remote assistant attachment mirror for channel=${binding.channel}: outbound files are not supported in the current adapter mode"
+            )
+            return
+        }
+        deliverOutboundViaOwnedGateway(outbound)
+    }
+
+    private suspend fun finishMessageToolTurn() {
+        runCatching { messageTool?.finishTurn() }
+        runCatching { spawnTool?.finishTurn() }
+    }
+
+    private fun startRemoteDeliveryTurn(sessionId: String) {
+        synchronized(remoteDeliveryTurnLock) {
+            remoteDeliveryTurns[normalizeSessionId(sessionId)] = false
+        }
+    }
+
+    private fun markCurrentRemoteDeliveryTurnSent() {
+        val sessionId = AgentLoop.currentSessionId()
+            ?.trim()
+            ?.ifBlank { null }
+            ?: return
+        synchronized(remoteDeliveryTurnLock) {
+            val normalizedSessionId = normalizeSessionId(sessionId)
+            if (normalizedSessionId in remoteDeliveryTurns) {
+                remoteDeliveryTurns[normalizedSessionId] = true
+            }
+        }
+    }
+
+    private fun wasRemoteDeliverySentInTurn(sessionId: String): Boolean {
+        return synchronized(remoteDeliveryTurnLock) {
+            remoteDeliveryTurns[normalizeSessionId(sessionId)] == true
+        }
+    }
+
+    private fun finishRemoteDeliveryTurn(sessionId: String) {
+        synchronized(remoteDeliveryTurnLock) {
+            remoteDeliveryTurns.remove(normalizeSessionId(sessionId))
+        }
+    }
+
+    /**
+     * Centralizes agent-turn setup and teardown so user turns, heartbeat runs,
+     * and cron executions all follow the same session lifecycle rules.
+     */
+    private suspend fun executeAgentTurn(request: AgentTurnRequest): AgentTurnExecution {
+        val normalizedSessionId = normalizeSessionId(request.sessionId)
+        return sessionTurnCoordinator.withSessionTurn(normalizedSessionId) {
+            executeAgentTurnLocked(request.copy(sessionId = normalizedSessionId))
+        }
+    }
+
+    private suspend fun executeAgentTurnLocked(request: AgentTurnRequest): AgentTurnExecution {
+        val normalizedSessionId = normalizeSessionId(request.sessionId)
+        val normalizedTitle = normalizedSessionTitle(normalizedSessionId, request.sessionTitle)
+        val normalizedInput = request.inputText.trim()
+        val normalizedAttachments = request.inputAttachments
+        require(normalizedInput.isNotBlank() || normalizedAttachments.isNotEmpty()) {
+            "message text and attachments are both blank"
+        }
+
+        ensureSessionAvailable(
+            sessionId = normalizedSessionId,
+            sessionTitle = normalizedTitle,
+            requireExistingSession = request.requireExistingSession
+        )
+        sessionRepository.touch(normalizedSessionId)
+
+        val beforeLatestAssistantId =
+            messageRepository.getLatestAssistantMessage(normalizedSessionId)?.id ?: 0L
+        var binding: SessionChannelBinding? = null
+        var failure: Throwable? = null
+        var messageSentInTurn = false
+        startRemoteDeliveryTurn(normalizedSessionId)
+        try {
+            binding = when (request.deliveryMode) {
+                AgentTurnDeliveryMode.UseSessionBinding -> prepareMessageToolTurnForSession(normalizedSessionId)
+                AgentTurnDeliveryMode.LocalOnly -> {
+                    prepareLocalMessageToolTurn(normalizedSessionId)
+                    null
+                }
+            }
+            agentLoop.run(
+                sessionId = normalizedSessionId,
+                newUserText = normalizedInput,
+                inputAttachments = normalizedAttachments,
+                inputRole = request.inputRole
+            )
+            sessionRepository.touch(normalizedSessionId)
+        } catch (t: Throwable) {
+            failure = t
+        } finally {
+            messageSentInTurn = runCatching {
+                messageTool?.wasSentInCurrentTurn() == true || wasRemoteDeliverySentInTurn(normalizedSessionId)
+            }
+                .getOrDefault(false)
+            finishMessageToolTurn()
+            finishRemoteDeliveryTurn(normalizedSessionId)
+        }
+
+        val latestAssistant = messageRepository.getLatestAssistantMessage(normalizedSessionId)
+        return AgentTurnExecution(
+            sessionId = normalizedSessionId,
+            beforeLatestAssistantId = beforeLatestAssistantId,
+            latestAssistantId = latestAssistant?.id ?: 0L,
+            latestAssistantContent = latestAssistant?.content,
+            latestAssistantAttachments = MessageAttachmentJsonCodec.decode(latestAssistant?.attachmentsJson),
+            binding = binding,
+            messageSentInTurn = messageSentInTurn,
+            failure = failure
+        )
+    }
+
+    private suspend fun ensureSessionAvailable(
+        sessionId: String,
+        sessionTitle: String,
+        requireExistingSession: Boolean
+    ) {
+        if (requireExistingSession) {
+            require(sessionRepository.getSession(sessionId) != null) { "session not found" }
+            withContext(Dispatchers.IO) {
+                workspaceManager.ensureWorkspace(sessionId, sessionTitle)
+            }
+            return
+        }
+        sessionRepository.ensureSessionExists(sessionId, sessionTitle)
+        withContext(Dispatchers.IO) {
+            workspaceManager.ensureWorkspace(sessionId, sessionTitle)
+        }
+    }
+
+    private suspend fun ensureLocalSessionWorkspace() {
+        sessionRepository.ensureSessionExists(
+            AppSession.LOCAL_SESSION_ID,
+            AppSession.LOCAL_SESSION_TITLE
+        )
+        sessionRepository.touch(AppSession.LOCAL_SESSION_ID)
+        withContext(Dispatchers.IO) {
+            workspaceManager.ensureWorkspace(
+                AppSession.LOCAL_SESSION_ID,
+                AppSession.LOCAL_SESSION_TITLE
+            )
+        }
+    }
+
+    private fun buildWorkspaceContext(sessionId: String): ContextBuilder.WorkspaceContext? {
+        val normalizedSessionId = normalizeSessionId(sessionId)
+        val snapshot = workspaceManager.getSnapshot(normalizedSessionId)
+            ?: workspaceManager.ensureWorkspace(
+                normalizedSessionId,
+                normalizedSessionTitle(normalizedSessionId, normalizedSessionId)
+            )
+        return ContextBuilder.WorkspaceContext(
+            workspaceRoot = snapshot.workspaceRoot,
+            docsDir = snapshot.docsDir,
+            scratchDir = snapshot.scratchDir,
+            artifactsDir = snapshot.artifactsDir,
+            sharedWorkspaceRoot = workspaceManager.sharedWorkspaceRoot().absolutePath
+        )
+    }
+
+    private fun normalizeSessionId(raw: String): String {
+        return raw.trim().ifBlank { AppSession.LOCAL_SESSION_ID }
+    }
+
+    private fun normalizedSessionTitle(sessionId: String, rawTitle: String): String {
+        return rawTitle.trim().ifBlank {
+            if (sessionId == AppSession.LOCAL_SESSION_ID) {
+                AppSession.LOCAL_SESSION_TITLE
+            } else {
+                sessionId
+            }
+        }
+    }
+
+    private fun findSessionChannelBinding(sessionId: String): SessionChannelBinding? {
+        val sid = sessionId.trim()
+        if (sid.isBlank()) return null
+        val raw = configStore.getSessionChannelBindings().firstOrNull { it.sessionId.trim() == sid } ?: return null
+        if (!raw.enabled) return null
+        val channel = raw.channel.trim().lowercase(Locale.US)
+        val chatId = raw.chatId.trim()
+        if (channel.isBlank() || chatId.isBlank()) return null
+        return when (channel) {
+            "telegram" -> {
+                val token = raw.telegramBotToken.trim()
+                if (token.isBlank()) return null
+                raw.copy(
+                    channel = channel,
+                    chatId = chatId,
+                    telegramBotToken = token,
+                    telegramAllowedChatId = raw.telegramAllowedChatId?.trim()?.ifBlank { null }
+                )
+            }
+            "discord" -> {
+                val token = raw.discordBotToken.trim()
+                if (token.isBlank()) return null
+                raw.copy(
+                    channel = channel,
+                    chatId = chatId,
+                    discordBotToken = token,
+                    discordResponseMode = normalizeDiscordResponseMode(raw.discordResponseMode),
+                    discordAllowedUserIds = raw.discordAllowedUserIds.map { it.trim() }.filter { it.isNotBlank() }
+                )
+            }
+            "slack" -> {
+                val botToken = raw.slackBotToken.trim()
+                val appToken = raw.slackAppToken.trim()
+                val normalizedChatId = normalizeSlackChannelId(chatId)
+                if (botToken.isBlank() || appToken.isBlank() || !isSlackChannelId(normalizedChatId)) return null
+                raw.copy(
+                    channel = channel,
+                    chatId = normalizedChatId,
+                    slackBotToken = botToken,
+                    slackAppToken = appToken,
+                    slackResponseMode = normalizeSlackResponseMode(raw.slackResponseMode),
+                    slackAllowedUserIds = raw.slackAllowedUserIds.map { it.trim() }.filter { it.isNotBlank() }
+                )
+            }
+            "feishu" -> {
+                val appId = raw.feishuAppId.trim()
+                val appSecret = raw.feishuAppSecret.trim()
+                val normalizedChatId = normalizeFeishuTargetId(chatId)
+                if (appId.isBlank() || appSecret.isBlank() || normalizedChatId.isBlank()) return null
+                raw.copy(
+                    channel = channel,
+                    chatId = normalizedChatId,
+                    feishuAppId = appId,
+                    feishuAppSecret = appSecret,
+                    feishuEncryptKey = raw.feishuEncryptKey.trim(),
+                    feishuVerificationToken = raw.feishuVerificationToken.trim(),
+                    feishuResponseMode = normalizeFeishuResponseMode(raw.feishuResponseMode),
+                    feishuAllowedOpenIds = raw.feishuAllowedOpenIds.map { it.trim() }.filter { it.isNotBlank() }
+                )
+            }
+            "email" -> {
+                val normalizedChatId = normalizeEmailAddress(chatId)
+                if (!raw.emailConsentGranted) return null
+                val imapHost = raw.emailImapHost.trim()
+                val imapUsername = raw.emailImapUsername.trim()
+                val imapPassword = raw.emailImapPassword
+                val smtpHost = raw.emailSmtpHost.trim()
+                val smtpUsername = raw.emailSmtpUsername.trim()
+                val smtpPassword = raw.emailSmtpPassword
+                val fromAddress = normalizeEmailAddress(raw.emailFromAddress)
+                if (
+                    imapHost.isBlank() ||
+                    imapUsername.isBlank() ||
+                    imapPassword.isBlank() ||
+                    smtpHost.isBlank() ||
+                    smtpUsername.isBlank() ||
+                    smtpPassword.isBlank() ||
+                    !emailAddressValidator.isValid(fromAddress)
+                ) return null
+                if (normalizedChatId.isNotBlank() && !emailAddressValidator.isValid(normalizedChatId)) return null
+                raw.copy(
+                    channel = channel,
+                    chatId = normalizedChatId,
+                    emailConsentGranted = true,
+                    emailImapHost = imapHost,
+                    emailImapPort = raw.emailImapPort.coerceIn(1, 65535),
+                    emailImapUsername = imapUsername,
+                    emailImapPassword = imapPassword,
+                    emailSmtpHost = smtpHost,
+                    emailSmtpPort = raw.emailSmtpPort.coerceIn(1, 65535),
+                    emailSmtpUsername = smtpUsername,
+                    emailSmtpPassword = smtpPassword,
+                    emailFromAddress = fromAddress
+                )
+            }
+            "wecom" -> {
+                val botId = raw.wecomBotId.trim()
+                val secret = raw.wecomSecret.trim()
+                val normalizedChatId = normalizeWeComTargetId(chatId)
+                if (botId.isBlank() || secret.isBlank()) return null
+                raw.copy(
+                    channel = channel,
+                    chatId = normalizedChatId,
+                    wecomBotId = botId,
+                    wecomSecret = secret,
+                    wecomAllowedUserIds = raw.wecomAllowedUserIds.map { it.trim() }.filter { it.isNotBlank() }
+                )
+            }
+            else -> null
+        }
+    }
+
+    private fun onGatewaySessionProcessingChanged(sessionId: String, processing: Boolean) {
+        val sid = sessionId.trim().ifBlank { AppSession.LOCAL_SESSION_ID }
+        var deferredConfig: ChannelsConfig? = null
+        var shouldStopGateway = false
+        synchronized(gatewayProcessingSessions) {
+            if (processing) {
+                gatewayProcessingSessions.add(sid)
+            } else {
+                gatewayProcessingSessions.remove(sid)
+                if (gatewayProcessingSessions.isEmpty()) {
+                    if (pendingGatewayStop) {
+                        shouldStopGateway = true
+                    } else {
+                        deferredConfig = pendingGatewayConfig
+                    }
+                    pendingGatewayConfig = null
+                    pendingGatewayStop = false
+                }
+            }
+            Unit
+        }
+        updateState()
+        if (shouldStopGateway) {
+            stopGatewayNow()
+        } else if (deferredConfig != null) {
+            runtimeScope.launch {
+                applyGatewayRuntimeConfig(deferredConfig!!)
+            }
+        }
+    }
+
+    private fun requestGatewayRuntimeConfig(config: ChannelsConfig) {
+        val shouldDefer = synchronized(gatewayProcessingSessions) {
+            pendingGatewayStop = false
+            if (gatewayProcessingSessions.isEmpty()) {
+                pendingGatewayConfig = null
+                false
+            } else {
+                pendingGatewayConfig = config
+                true
+            }
+        }
+        if (!shouldDefer) {
+            applyGatewayRuntimeConfig(config)
+        }
+    }
+
+    private fun stopGatewayNow() {
+        pendingGatewayConfig = null
+        channelGatewayLifecycle.stop()
+    }
+
+    private fun resolveGatewaySessionBinding(message: InboundMessage): String? {
+        val c = message.channel.trim().lowercase(Locale.US)
+        val targetIds = when (c) {
+            "discord" -> listOf(normalizeDiscordChannelId(message.chatId))
+            "slack" -> listOf(normalizeSlackChannelId(message.chatId))
+            "feishu" -> com.palmclaw.channels.buildFeishuTargetAliases(
+                primaryTargetId = message.chatId,
+                sourceChatId = message.metadata["source_chat_id"].orEmpty(),
+                senderOpenId = message.metadata["sender_open_id"].orEmpty()
+            )
+            "email" -> listOf(normalizeEmailAddress(message.chatId))
+            "wecom" -> listOf(normalizeWeComTargetId(message.chatId))
+            else -> listOf(message.chatId.trim())
+        }.filter { it.isNotBlank() }
+        if (c.isBlank() || targetIds.isEmpty()) return null
+        val adapterKey = message.metadata[GatewayOrchestrator.KEY_ADAPTER_KEY]?.trim()?.ifBlank { null }
+        val bindings = configStore.getSessionChannelBindings()
+        val exact = bindings.firstOrNull {
+            val channelMatches = it.enabled && it.channel.trim().lowercase(Locale.US) == c
+            if (!channelMatches) return@firstOrNull false
+            if (it.chatId.trim() !in targetIds) return@firstOrNull false
+            if (adapterKey == null) return@firstOrNull false
+            ChannelAdapterIdentity.keysForBinding(it).contains(adapterKey)
+        }
+        if (exact != null) return exact.sessionId.trim().ifBlank { null }
+        return bindings.firstOrNull {
+            it.enabled && it.channel.trim().lowercase(Locale.US) == c && it.chatId.trim() in targetIds
+        }?.sessionId?.trim()?.ifBlank { null }
+    }
+
+    private suspend fun persistCronSettings(update: CronConfigUpdate): CronConfig {
+        val current = configStore.getCronConfig()
+        val minEveryMs = update.minEveryMs ?: current.minEveryMs
+        if (minEveryMs !in AppLimits.MIN_CRON_MIN_EVERY_MS..AppLimits.MAX_CRON_MIN_EVERY_MS) {
+            throw IllegalArgumentException(
+                "Cron min interval ms must be between ${AppLimits.MIN_CRON_MIN_EVERY_MS} and ${AppLimits.MAX_CRON_MIN_EVERY_MS}"
+            )
+        }
+        val maxJobs = update.maxJobs ?: current.maxJobs
+        if (maxJobs !in AppLimits.MIN_CRON_MAX_JOBS..AppLimits.MAX_CRON_MAX_JOBS) {
+            throw IllegalArgumentException(
+                "Cron max jobs must be between ${AppLimits.MIN_CRON_MAX_JOBS} and ${AppLimits.MAX_CRON_MAX_JOBS}"
+            )
+        }
+        val config = CronConfig(
+            enabled = update.enabled ?: current.enabled,
+            minEveryMs = minEveryMs,
+            maxJobs = maxJobs
+        )
+        configStore.saveCronConfig(config)
+        checkNotNull(automationRuntimeLifecycle).applyCronConfig(config)
+        return config
+    }
+
+    private suspend fun setCronEnabledFromTool(enabled: Boolean) {
+        persistCronSettings(CronConfigUpdate(enabled = enabled))
+    }
+
+    private fun applyGatewayRuntimeConfig(config: ChannelsConfig) {
+        val sessionBindings = configStore.getSessionChannelBindings()
+        val shouldEnableGateway = sessionBindings.any(channelBindingRuntimeProjector::canStartAdapter)
+        val effectiveConfig = if (config.enabled == shouldEnableGateway) {
+            config
+        } else {
+            config.copy(enabled = shouldEnableGateway).also { configStore.saveChannelsConfig(it) }
+        }
+        val lifecycleSnapshot = channelGatewayLifecycle.apply(
+            enabled = effectiveConfig.enabled,
+            bindings = sessionBindings
+        )
+        if (!lifecycleSnapshot.running) {
+            synchronized(gatewayProcessingSessions) {
+                gatewayProcessingSessions.clear()
+            }
+            updateState()
+        }
+    }
+
+    private fun updateState(
+        gatewayRunning: Boolean? = null,
+        activeAdapterCount: Int? = null,
+        lastError: String? = null,
+        mcpSnapshot: McpRuntimeSnapshot? = null
+    ) {
+        synchronized(runtimeStateLock) {
+            val current = runtimeState
+            val next = GatewayRuntimeState(
+                gatewayRunning = gatewayRunning ?: current.gatewayRunning,
+                activeAdapterCount = activeAdapterCount ?: current.activeAdapterCount,
+                lastError = lastError ?: current.lastError,
+                processingSessionIds = synchronized(gatewayProcessingSessions) {
+                    gatewayProcessingSessions.toSet()
+                },
+                mcpSnapshot = mcpSnapshot ?: current.mcpSnapshot
+            )
+            runtimeState = next
+            onStateChanged(next)
+        }
+    }
+
+    private fun McpServerSnapshot.toRuntimeMcpStatus(): McpRuntimeStatus = McpRuntimeStatus(
+        status = when (phase) {
+            McpServerPhase.DISABLED -> "Disabled"
+            McpServerPhase.ACTION_REQUIRED -> "Action required"
+            McpServerPhase.CONNECTING -> "Connecting"
+            McpServerPhase.READY -> "Connected"
+            McpServerPhase.DEGRADED -> "Degraded"
+            McpServerPhase.ERROR -> "Error"
+        },
+        serverName = serverName,
+        endpoint = endpoint,
+        configFingerprint = configFingerprint,
+        phase = phase.name.lowercase(Locale.US),
+        usable = usable,
+        detail = detail.orEmpty(),
+        toolCount = toolCount,
+        toolNames = toolNames,
+        resourceCount = resourceCount,
+        resourceTemplateCount = resourceTemplateCount,
+        promptCount = promptCount,
+        completionSupported = completionSupported,
+        transport = transport?.name?.lowercase(Locale.US),
+        protocolVersion = protocolVersion,
+        endpointSecurity = endpointSecurity?.name?.lowercase(Locale.US),
+        insecureWarning = insecureWarning,
+        generation = generation
+    )
+
+    private suspend fun decideHeartbeat(content: String): HeartbeatDecision {
+        val provider = providerFactory.create(configStore.getConfig())
+        val response = provider.chat(
+            messages = listOf(
+                ChatMessage(
+                    role = "system",
+                    content = "You are a heartbeat agent. Call heartbeat tool with action=skip or run."
+                ),
+                ChatMessage(
+                    role = "user",
+                    content = "Review HEARTBEAT.md and decide if there are active tasks.\n\n$content"
+                )
+            ),
+            toolsSpec = listOf(heartbeatToolSpec())
+        )
+        val call = response.assistant.toolCalls.firstOrNull { it.name == HEARTBEAT_TOOL_NAME }
+            ?: return HeartbeatDecision(action = HEARTBEAT_ACTION_SKIP, tasks = "")
+        return runCatching {
+            val args = JSONObject(call.argumentsJson)
+            val action = args.optString("action").lowercase(Locale.US)
+            val tasks = args.optString("tasks")
+            when (action) {
+                HEARTBEAT_ACTION_RUN -> HeartbeatDecision(action = HEARTBEAT_ACTION_RUN, tasks = tasks)
+                else -> HeartbeatDecision(action = HEARTBEAT_ACTION_SKIP, tasks = "")
+            }
+        }.getOrElse {
+            HeartbeatDecision(action = HEARTBEAT_ACTION_SKIP, tasks = "")
+        }
+    }
+
+    private fun heartbeatToolSpec(): ToolSpec {
+        return ToolSpec(
+            name = HEARTBEAT_TOOL_NAME,
+            description = "Report heartbeat decision after reviewing HEARTBEAT.md.",
+            parameters = buildJsonObject {
+                put("type", "object")
+                put("required", buildJsonArray { add(JsonPrimitive("action")) })
+                put("properties", buildJsonObject {
+                    put("action", buildJsonObject {
+                        put("type", "string")
+                        put("enum", buildJsonArray {
+                            add(JsonPrimitive(HEARTBEAT_ACTION_SKIP))
+                            add(JsonPrimitive(HEARTBEAT_ACTION_RUN))
+                        })
+                    })
+                    put("tasks", buildJsonObject { put("type", "string") })
+                })
+            }
+        )
+    }
+
+    private fun parseHeartbeatTasks(content: String): ParsedHeartbeatTasks {
+        val lines = content.replace("\r\n", "\n").lines()
+        val activeIndex = lines.indexOfFirst { it.trim().equals("## Active Tasks", ignoreCase = true) }
+        if (activeIndex < 0) {
+            return ParsedHeartbeatTasks(hasActiveSection = false, tasks = "")
+        }
+        val sectionLines = lines.drop(activeIndex + 1).takeWhile { !it.trim().startsWith("## ") }
+        val cleaned = cleanHeartbeatTaskLines(sectionLines)
+        return ParsedHeartbeatTasks(hasActiveSection = true, tasks = cleaned.joinToString("\n").trim())
+    }
+
+    private fun cleanHeartbeatTaskLines(lines: List<String>): List<String> {
+        val result = mutableListOf<String>()
+        var inComment = false
+        for (raw in lines) {
+            var line = raw
+            if (inComment) {
+                val end = line.indexOf("-->")
+                if (end < 0) continue
+                line = line.substring(end + 3)
+                inComment = false
+            }
+            while (true) {
+                val start = line.indexOf("<!--")
+                if (start < 0) break
+                val end = line.indexOf("-->", start + 4)
+                line = if (end >= 0) {
+                    line.removeRange(start, end + 3)
+                } else {
+                    inComment = true
+                    line.substring(0, start)
+                }
+            }
+            val text = line.trim()
+            if (text.isBlank()) continue
+            if (text.startsWith("#")) continue
+            if (text == "---" || text == "***" || text == "___") continue
+            result += text
+        }
+        return result
+    }
+    private fun readHeartbeatDoc(): String {
+        heartbeatDocFile.parentFile?.mkdirs()
+        if (!heartbeatDocFile.exists()) {
+            heartbeatDocFile.writeText(templateStore.loadTemplate(HeartbeatDoc.FILE_NAME).orEmpty(), Charsets.UTF_8)
+        }
+        return runCatching { heartbeatDocFile.readText(Charsets.UTF_8) }
+            .getOrDefault(templateStore.loadTemplate(HeartbeatDoc.FILE_NAME).orEmpty())
+    }
+
+    private fun normalizeDiscordChannelId(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isBlank()) return ""
+        val mentionMatch = Regex("^<#(\\d+)>$").matchEntire(trimmed)
+        if (mentionMatch != null) return mentionMatch.groupValues.getOrNull(1).orEmpty()
+        val digits = trimmed.filter { it.isDigit() }
+        return if (digits.length in 15..30) digits else trimmed
+    }
+
+    private fun normalizeDiscordResponseMode(raw: String): String = if (raw.trim().lowercase(Locale.US) == "open") "open" else "mention"
+
+    private fun normalizeSlackChannelId(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isBlank()) return ""
+        val mentionMatch = Regex("^<#([A-Za-z0-9]+)(?:\\|[^>]+)?>$").matchEntire(trimmed)
+        if (mentionMatch != null) return mentionMatch.groupValues.getOrNull(1).orEmpty().uppercase(Locale.US)
+        val detected = Regex("([CDG][A-Za-z0-9]{8,})").find(trimmed)?.groupValues?.getOrNull(1)
+        return (detected ?: trimmed).trim().uppercase(Locale.US)
+    }
+
+    private fun normalizeSlackResponseMode(raw: String): String = if (raw.trim().lowercase(Locale.US) == "open") "open" else "mention"
+    private fun normalizeFeishuResponseMode(raw: String): String = if (raw.trim().lowercase(Locale.US) == "open") "open" else "mention"
+    private fun normalizeFeishuTargetId(raw: String): String = (Regex("((?:ou|oc)_[A-Za-z0-9_-]+)").find(raw.trim())?.groupValues?.getOrNull(1) ?: raw.trim()).trim()
+    private fun normalizeWeComTargetId(raw: String): String = raw.trim()
+    private fun normalizeEmailAddress(raw: String): String = raw.trim().lowercase(Locale.US)
+    private fun isDiscordSnowflake(value: String): Boolean = value.length in 15..30 && value.all { it.isDigit() }
+    private fun isSlackChannelId(value: String): Boolean {
+        val normalized = value.trim().uppercase(Locale.US)
+        if (normalized.length !in 9..30) return false
+        if (!(normalized.startsWith("C") || normalized.startsWith("D") || normalized.startsWith("G"))) return false
+        return normalized.all { it.isLetterOrDigit() }
+    }
+    private fun isFeishuTargetId(value: String): Boolean {
+        val normalized = value.trim()
+        return normalized.startsWith("ou_") || normalized.startsWith("oc_")
+    }
+    private data class SessionTarget(val id: String, val title: String)
+    private enum class AgentTurnDeliveryMode { UseSessionBinding, LocalOnly }
+    private data class AgentTurnRequest(
+        val sessionId: String,
+        val sessionTitle: String,
+        val inputText: String,
+        val inputAttachments: List<MessageAttachment> = emptyList(),
+        val inputRole: String = "user",
+        val deliveryMode: AgentTurnDeliveryMode,
+        val requireExistingSession: Boolean = false
+    )
+    private data class AgentTurnExecution(
+        val sessionId: String,
+        val beforeLatestAssistantId: Long,
+        val latestAssistantId: Long,
+        val latestAssistantContent: String?,
+        val latestAssistantAttachments: List<MessageAttachment> = emptyList(),
+        val binding: SessionChannelBinding?,
+        val messageSentInTurn: Boolean = false,
+        val failure: Throwable? = null
+    ) {
+        fun latestAssistantContentIfNew(): String? {
+            return if (latestAssistantId > beforeLatestAssistantId) latestAssistantContent else null
+        }
+
+        fun throwIfFailed() {
+            failure?.let { throw it }
+        }
+    }
+    private data class HeartbeatDecision(val action: String, val tasks: String)
+    private data class ParsedHeartbeatTasks(val hasActiveSection: Boolean, val tasks: String)
+    companion object {
+        private const val TAG = "GatewayRuntime"
+        private const val HEARTBEAT_TOOL_NAME = "heartbeat"
+        private const val HEARTBEAT_ACTION_SKIP = "skip"
+        private const val HEARTBEAT_ACTION_RUN = "run"
+    }
+}

@@ -1,0 +1,2649 @@
+package com.palmclaw.ui
+
+import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
+import android.os.PowerManager
+import android.util.Log
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.palmclaw.AppContainer
+import com.palmclaw.bus.InboundMessage
+import com.palmclaw.bus.MessageAttachment
+import com.palmclaw.channels.ChannelAdapterIdentity
+import com.palmclaw.channels.ChannelDiscoveryFailureKind
+import com.palmclaw.channels.ChannelDiscoveryOutcome
+import com.palmclaw.channels.EmailDiscoveryRequest
+import com.palmclaw.channels.FeishuDiscoveryRequest
+import com.palmclaw.channels.TelegramDiscoveryRequest
+import com.palmclaw.channels.WeComDiscoveryRequest
+import com.palmclaw.channels.buildFeishuTargetAliases
+import com.palmclaw.channels.GatewayOrchestrator
+import com.palmclaw.config.AppLimits
+import com.palmclaw.config.AppSession
+import com.palmclaw.config.AppStoragePaths
+import com.palmclaw.config.AlwaysOnConfig
+import com.palmclaw.config.ChannelsConfig
+import com.palmclaw.config.CronConfig
+import com.palmclaw.config.HeartbeatDoc
+import com.palmclaw.config.HeartbeatConfig
+import com.palmclaw.config.McpHttpConfig
+import com.palmclaw.config.OnboardingConfig
+import com.palmclaw.config.SearchProviderConfigs
+import com.palmclaw.config.SearchProviderId
+import com.palmclaw.config.SessionChannelBindingRules
+import com.palmclaw.config.SessionChannelBinding
+import com.palmclaw.cron.CronLogStore
+import com.palmclaw.cron.CronJob
+import com.palmclaw.providers.AdaptiveLlmProvider
+import com.palmclaw.providers.ChatMessage
+import com.palmclaw.providers.LlmProviderFactory
+import com.palmclaw.providers.ProviderCatalog
+import com.palmclaw.providers.ProviderProtocol
+import com.palmclaw.providers.ProviderResolutionStore
+import com.palmclaw.runtime.control.ChannelBindingUpdate
+import com.palmclaw.runtime.control.HeartbeatUpdate
+import com.palmclaw.runtime.control.RuntimeRefreshPort
+import com.palmclaw.runtime.control.RuntimeSettingsUpdate
+import com.palmclaw.storage.entities.MessageEntity
+import com.palmclaw.storage.entities.SessionEntity
+import com.palmclaw.tools.BuiltInToolCatalog
+import com.palmclaw.ui.settings.ToolSettingsCoordinator
+import com.palmclaw.ui.settings.SkillSettingsCoordinator
+import com.palmclaw.ui.settings.SkillSettingsMapper
+import com.palmclaw.ui.settings.UiBuiltInToolConfig
+import com.palmclaw.ui.settings.UiSkillConfig
+import java.util.Locale
+import java.util.UUID
+import java.text.SimpleDateFormat
+import java.util.Date
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.TimeUnit
+
+data class ChatChromeState(
+    val useChinese: Boolean = false,
+    val darkTheme: Boolean = false
+)
+
+class ChatViewModel(
+    app: Application,
+    container: AppContainer = AppContainer.from(app)
+) : AndroidViewModel(app) {
+
+    private val environment = ChatViewModelEnvironment(container)
+    private val storageMigration: Unit = environment.storageMigration
+    private val chatRepository = environment.chatRepository
+    private val cronService = environment.cronService
+    private val cronLogStore = environment.cronLogStore
+    private val agentLogStore = environment.agentLogStore
+    private val configStore = environment.configStore
+    private val providerResolutionStore = environment.providerResolutionStore
+    private val memoryStore = environment.memoryStore
+    private val templateStore = environment.templateStore
+    private val runtimeStatusSource = environment.runtimeStatusSource
+    private val runtimeExecutionGateway = environment.runtimeExecutionGateway
+    private val runtimeRefreshGateway = environment.runtimeRefreshGateway
+    private val runtimeControlService = environment.runtimeControlService
+    private val channelBindingRuntimeProjector = environment.channelBindingRuntimeProjector
+    private val channelRuntimeSnapshotSource = environment.channelRuntimeSnapshotSource
+    private val gatewayStatusOverviewAssembler = environment.gatewayStatusOverviewAssembler
+    private val channelDiscoveryService = environment.channelDiscoveryService
+    private val heartbeatRuntimePort = environment.heartbeatRuntimePort
+    private val channelBindingService = environment.channelBindingService
+    private val attachmentTransferService = environment.attachmentTransferService
+    private val skillRepository = environment.skillRepository
+    private val heartbeatDocFile = environment.heartbeatDocFile
+
+    private var currentSessionId: String =
+        configStore.getLastActiveSessionId() ?: AppSession.LOCAL_SESSION_ID
+    private val initialUiPrefs = configStore.getUiPreferencesConfig()
+    private val initialOnboarding = OnboardingCoordinator.resolveSyncedOnboardingConfig(
+        configStore = configStore,
+        memoryStore = memoryStore,
+        baseConfig = configStore.getOnboardingConfig()
+    )
+    private val _uiState = ChatStateStore(
+        ChatUiState(
+            currentSessionId = currentSessionId,
+            currentSessionTitle = if (currentSessionId == AppSession.LOCAL_SESSION_ID) {
+                AppSession.LOCAL_SESSION_TITLE
+            } else {
+                currentSessionId
+            },
+            settingsUseChinese = initialUiPrefs.useChinese,
+            settingsDarkTheme = initialUiPrefs.darkTheme,
+            onboardingCompleted = initialOnboarding.completed,
+            userDisplayName = initialOnboarding.userDisplayName,
+            agentDisplayName = initialOnboarding.agentDisplayName,
+            onboardingUserDisplayName = initialOnboarding.userDisplayName,
+            onboardingAgentDisplayName = initialOnboarding.agentDisplayName
+        )
+    )
+    val chatContentState: StateFlow<ChatContentState> = _uiState.chatContentState
+    val chatTimelineState: StateFlow<ChatTimelineState> = _uiState.chatTimelineState
+    val chatComposerState: StateFlow<ChatComposerState> = _uiState.chatComposerState
+    val sessionListState: StateFlow<SessionListState> = _uiState.sessionListState
+    private val _startupState = MutableStateFlow(StartupUiState())
+    val startupState: StateFlow<StartupUiState> = _startupState.asStateFlow()
+    val onboardingUiState: StateFlow<OnboardingUiState> = _uiState.onboardingUiState
+    val settingsShellState: StateFlow<SettingsShellState> = _uiState.settingsShellState
+    val identityDisplayState: StateFlow<IdentityDisplayState> = _uiState.identityDisplayState
+    val providerSettingsState: StateFlow<ProviderSettingsState> = _uiState.providerSettingsState
+    val channelsSettingsState: StateFlow<ChannelsSettingsState> = _uiState.channelsSettingsState
+    val skillsDiscoveryState: StateFlow<SkillsDiscoveryState> = _uiState.skillsDiscoveryState
+    val toolSettingsState: StateFlow<ToolSettingsState> = _uiState.toolSettingsState
+    val automationSettingsState: StateFlow<AutomationSettingsState> = _uiState.automationSettingsState
+    val alwaysOnSettingsState: StateFlow<AlwaysOnSettingsState> = _uiState.alwaysOnSettingsState
+    val mcpSettingsState: StateFlow<McpSettingsState> = _uiState.mcpSettingsState
+    val updateSettingsState: StateFlow<UpdateSettingsState> = _uiState.updateSettingsState
+    val sessionBindingState: StateFlow<SessionBindingState> = _uiState.sessionBindingState
+    val chromeState: StateFlow<ChatChromeState> = settingsShellState
+        .map { ChatChromeState(useChinese = it.useChinese, darkTheme = it.darkTheme) }
+        .distinctUntilChanged()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Eagerly,
+            initialValue = ChatChromeState(
+                useChinese = initialUiPrefs.useChinese,
+                darkTheme = initialUiPrefs.darkTheme
+            )
+        )
+    private val uiJson = environment.uiJson
+    private val messageUiProjector = MessageUiProjector(
+        uiJson = uiJson,
+        toolArgsPreviewMaxCharsProvider = ::runtimeToolArgsPreviewMaxChars
+    )
+
+    private var generatingJob: Job? = null
+    private var channelDiscoveryJob: Job? = null
+    private var firstRunAutoIntroPending = false
+    private var startupSettingsLoaded = false
+    private var startupSessionsLoaded = false
+    private var startupMessagesLoaded = false
+    private var mcpServerStatuses: Map<String, UiMcpServerRuntimeStatus> = emptyMap()
+    private val runtimeControlRefreshPort = object : RuntimeRefreshPort {
+        override fun applyHeartbeatConfig(config: HeartbeatConfig) {
+            runtimeRefreshGateway.reloadAutomation()
+        }
+
+        override fun applyChannelsConfig(config: ChannelsConfig) {
+            refreshSessionBindingsInState()
+            requestGatewayRuntimeRefresh()
+            _uiState.updateChannelsSettingsState { it.copy(gatewayEnabled = config.enabled) }
+        }
+    }
+    private val gatewayProcessingCoordinator = GatewayProcessingCoordinator()
+    private val runtimeStatusCoordinator = RuntimeStatusCoordinator(
+        scope = viewModelScope,
+        stateStore = _uiState,
+        statusSource = runtimeStatusSource,
+        gatewayProcessingCoordinator = gatewayProcessingCoordinator,
+        refreshGateway = runtimeRefreshGateway,
+        onProcessingChanged = ::syncGeneratingState,
+        onMcpSnapshotChanged = ::onMcpRuntimeSnapshotChanged
+    )
+    private val sessionCoordinator = ChatSessionCoordinator(
+        scope = viewModelScope,
+        stateStore = _uiState,
+        dependencies = ChatSessionCoordinator.Dependencies(
+            currentSessionId = { currentSessionId },
+            setCurrentSessionId = { currentSessionId = it },
+            saveLastActiveSessionId = { configStore.saveLastActiveSessionId(it) },
+            computeIsGeneratingForSession = ::computeIsGeneratingForSession,
+            observeSessionsSource = { chatRepository.observeSessions() },
+            observeRecentMessagesSource = { sessionId, limit ->
+                chatRepository.observeRecentMessages(sessionId, limit)
+            },
+            loadRecentMessagesSource = { sessionId, limit ->
+                chatRepository.getRecentMessages(sessionId, limit)
+            },
+            loadMessagesBeforeSource = { sessionId, beforeCreatedAt, beforeId, limit ->
+                chatRepository.getMessagesBefore(sessionId, beforeCreatedAt, beforeId, limit)
+            },
+            buildSessionSummaries = ::buildSessionSummaries,
+            buildConnectedChannelsOverview = ::buildConnectedChannelsOverview,
+            mapObservedMessagesToUi = { sessionId, messages ->
+                mapMessagesToUi(sessionId, messages)
+            },
+            resolveOnboardingConfig = { onboardingCoordinator.resolveSyncedOnboardingConfig() },
+            onSessionsObserved = ::markStartupSessionsLoaded,
+            onMessagesObserved = ::markStartupMessagesLoaded
+        ),
+        actions = ChatSessionCoordinator.Actions(
+            bootstrapLocalSessions = ::bootstrapLocalSessions,
+            sendMessage = ::sendMessageInternal,
+            stopGeneration = ::stopGenerationInternal,
+            createSession = ::createSessionInternal,
+            renameSession = ::renameSessionInternal,
+            deleteSession = ::deleteSessionInternal
+        )
+    )
+    private val providerSettingsCoordinator = ProviderSettingsCoordinator(
+        stateStore = _uiState,
+        clearTokenUsageStats = {
+            configStore.clearTokenUsageStats()
+            configStore.getTokenUsageStats()
+        },
+        persistOnboardingProviderDraftIfNeeded = ::persistOnboardingProviderDraftIfNeeded,
+        actions = ProviderSettingsCoordinator.Actions(
+            setActiveProviderConfig = ::setActiveProviderConfigInternal,
+            deleteProviderConfig = ::deleteProviderConfigInternal,
+            saveProviderSettings = ::saveProviderSettingsInternal,
+            saveAgentRuntimeSettings = ::saveAgentRuntimeSettingsInternal,
+            testProviderSettings = ::testProviderSettingsInternal
+        )
+    )
+    private val toolSettingsCoordinator = ToolSettingsCoordinator(
+        stateStore = _uiState,
+        actions = ToolSettingsCoordinator.Actions(
+            saveToolSettings = ::saveToolSettingsInternal
+        )
+    )
+    private val skillSettingsCoordinator = SkillSettingsCoordinator(
+        scope = viewModelScope,
+        stateStore = _uiState,
+        skillRepository = skillRepository,
+        actions = SkillSettingsCoordinator.Actions(
+            saveSkillSettings = ::saveSkillSettingsInternal,
+            getConfig = { configStore.getConfig() },
+            saveConfig = { configStore.saveConfig(it) },
+            refreshGatewayRuntimeConfig = { runtimeRefreshGateway.refreshGatewayRuntimeConfig() },
+            refreshSkillCatalog = ::refreshSkillCatalogInternal
+        )
+    )
+    private val channelBindingCoordinator = ChannelBindingCoordinator(
+        scope = viewModelScope,
+        stateStore = _uiState,
+        channelBindingService = channelBindingService,
+        emailAddressValidator = environment.emailAddressValidator,
+        actions = ChannelBindingCoordinator.Actions(
+            setSessionChannelEnabled = ::setSessionChannelEnabledInternalFacade,
+            discoverTelegramChatsForBinding = ::discoverTelegramChatsForBindingInternal,
+            clearTelegramChatDiscovery = ::clearTelegramChatDiscoveryInternal,
+            discoverFeishuChatsForBinding = ::discoverFeishuChatsForBindingInternal,
+            clearFeishuChatDiscovery = ::clearFeishuChatDiscoveryInternal,
+            discoverEmailSendersForBinding = ::discoverEmailSendersForBindingInternal,
+            clearEmailSenderDiscovery = ::clearEmailSenderDiscoveryInternal,
+            discoverWeComChatsForBinding = ::discoverWeComChatsForBindingInternal,
+            clearWeComChatDiscovery = ::clearWeComChatDiscoveryInternal,
+            refreshSessionConnectionStatus = ::refreshSessionConnectionStatusInternal,
+            refreshSessionBindingsInState = ::refreshSessionBindingsInState,
+            refreshGatewayRuntimeConfig = { runtimeRefreshGateway.refreshGatewayRuntimeConfig() }
+        )
+    )
+    private val runtimeCoordinator = RuntimeCoordinator(
+        stateStore = _uiState,
+        actions = RuntimeCoordinator.Actions(
+            loadSettingsIntoState = ::loadSettingsIntoState,
+            startRuntimeStatusObservation = runtimeStatusCoordinator::start,
+            startGatewayIfEnabled = ::startGatewayIfEnabled,
+            refreshAlwaysOnDiagnostics = ::refreshAlwaysOnDiagnosticsInternal,
+            refreshCronJobs = ::refreshCronJobsInternal,
+            setCronJobEnabled = ::setCronJobEnabledInternal,
+            runCronJobNow = ::runCronJobNowInternal,
+            removeCronJob = ::removeCronJobInternal,
+            triggerHeartbeatNow = ::triggerHeartbeatNowInternal,
+            loadHeartbeatDocument = ::loadHeartbeatDocumentInternal,
+            saveHeartbeatDocument = ::saveHeartbeatDocumentInternal,
+            refreshCronLogs = ::refreshCronLogsInternal,
+            clearCronLogs = ::clearCronLogsInternal,
+            refreshAgentLogs = ::refreshAgentLogsInternal,
+            clearAgentLogs = ::clearAgentLogsInternal,
+            saveCronSettings = ::saveCronSettingsInternal,
+            saveHeartbeatSettings = ::saveHeartbeatSettingsInternal,
+            saveAlwaysOnSettings = ::saveAlwaysOnSettingsInternal,
+            saveChannelsSettings = ::saveChannelsSettingsInternal,
+            saveMcpSettings = ::saveMcpSettingsInternal
+        )
+    )
+    private val onboardingCoordinator = OnboardingCoordinator(
+        scope = viewModelScope,
+        stateStore = _uiState,
+        configStore = configStore,
+        memoryStore = memoryStore,
+        buildProviderStateWithSavedDraft = ProviderSettingsMapper::buildStateWithSavedDraft,
+        buildProviderSettingsConfig = { state ->
+            ProviderSettingsMapper.buildSettingsConfig(configStore.getConfig(), state)
+        },
+        selectLocalSession = { selectSession(AppSession.LOCAL_SESSION_ID) },
+        loadSettingsIntoState = ::loadSettingsIntoState,
+        maybeTriggerFirstRunAutoIntro = ::maybeTriggerFirstRunAutoIntro
+    )
+    private val appUpdateCoordinator = AppUpdateCoordinator(
+        app = app,
+        scope = viewModelScope,
+        stateStore = _uiState,
+        configStore = configStore,
+        updateCheckClient = environment.updateCheckClient
+    )
+
+    init {
+        storageMigration
+        sessionCoordinator.bootstrapLocalSessions()
+        runtimeCoordinator.loadSettingsIntoState()
+        markStartupSettingsLoaded()
+        runtimeCoordinator.startRuntimeStatusObservation()
+        sessionCoordinator.observeSessions()
+        sessionCoordinator.observeMessages(currentSessionId)
+        runtimeCoordinator.startGatewayIfEnabled()
+        runtimeCoordinator.refreshAlwaysOnDiagnostics()
+        appUpdateCoordinator.bootstrapAutomaticCheck()
+    }
+
+    private fun markStartupSettingsLoaded() {
+        startupSettingsLoaded = true
+        updateStartupReady()
+    }
+
+    private fun markStartupSessionsLoaded() {
+        startupSessionsLoaded = true
+        updateStartupReady()
+    }
+
+    private fun markStartupMessagesLoaded(sessionId: String) {
+        val observedSessionId = sessionId.trim().ifBlank { AppSession.LOCAL_SESSION_ID }
+        val activeSessionId = currentSessionId.trim().ifBlank { AppSession.LOCAL_SESSION_ID }
+        if (observedSessionId != activeSessionId) return
+        startupMessagesLoaded = true
+        updateStartupReady()
+    }
+
+    private fun updateStartupReady() {
+        if (_startupState.value.ready) return
+        if (!startupSettingsLoaded || !startupSessionsLoaded || !startupMessagesLoaded) return
+        _startupState.value = _startupState.value.copy(ready = true)
+    }
+
+    fun onInputChanged(value: String): Unit {
+        sessionCoordinator.onInputChanged(value)
+    }
+
+    fun sendMessage(): Unit {
+        sessionCoordinator.sendMessage()
+    }
+
+    fun importComposerAttachments(uriStrings: List<String>) {
+        val normalizedUris = uriStrings.map { it.trim() }.filter { it.isNotBlank() }
+        if (normalizedUris.isEmpty()) return
+        viewModelScope.launch {
+            val sessionId = currentSessionId.trim().ifBlank { AppSession.LOCAL_SESSION_ID }
+            val sessionTitle = _uiState.sessionListState.value.currentSessionTitle.ifBlank { sessionId }
+            _uiState.updateChatComposerState {
+                it.copy(
+                    composerImporting = true,
+                    composerAttachmentError = null
+                )
+            }
+            runCatching {
+                attachmentTransferService.importComposerDrafts(
+                    sessionId = sessionId,
+                    sessionTitle = sessionTitle,
+                    uriStrings = normalizedUris
+                )
+            }.onSuccess { attachments ->
+                _uiState.updateChatComposerState { state ->
+                    state.copy(
+                        composerAttachments = state.composerAttachments + attachments.map { attachment ->
+                            UiComposerAttachmentDraft(
+                                id = UUID.randomUUID().toString(),
+                                attachment = attachment.toUiAttachment()
+                            )
+                        },
+                        composerImporting = false,
+                        composerAttachmentError = null
+                    )
+                }
+            }.onFailure { t ->
+                Log.e(TAG, "Failed to import composer attachments", t)
+                _uiState.updateChatComposerState {
+                    it.copy(
+                        composerImporting = false,
+                        composerAttachmentError = t.message ?: t.javaClass.simpleName
+                    )
+                }
+            }
+        }
+    }
+
+    fun removeComposerAttachment(draftId: String) {
+        val targetId = draftId.trim()
+        if (targetId.isBlank()) return
+        _uiState.updateChatComposerState {
+            it.copy(
+                composerAttachments = it.composerAttachments.filterNot { draft -> draft.id == targetId },
+                composerAttachmentError = null
+            )
+        }
+    }
+
+    fun clearComposerAttachments() {
+        _uiState.updateChatComposerState {
+            it.copy(
+                composerAttachments = emptyList(),
+                composerAttachmentError = null
+            )
+        }
+    }
+
+    private fun sendMessageInternal(text: String) {
+        val draftsSnapshot = _uiState.chatComposerState.value.composerAttachments
+        val sessionId = currentSessionId.trim().ifBlank { AppSession.LOCAL_SESSION_ID }
+        val sessionTitle = _uiState.sessionListState.value.currentSessionTitle.ifBlank { sessionId }
+        generatingJob = viewModelScope.launch {
+            try {
+                _uiState.updateChatComposerState {
+                    it.copy(
+                        composerAttachments = emptyList(),
+                        composerAttachmentError = null
+                    )
+                }
+                runtimeExecutionGateway.runUserMessage(
+                    sessionId = sessionId,
+                    sessionTitle = sessionTitle,
+                    text = text,
+                    attachments = draftsSnapshot.map { it.attachment.toMessageAttachment() }
+                )
+                sessionCoordinator.refreshRecentMessages(sessionId)
+            } catch (t: CancellationException) {
+                throw t
+            } catch (t: Throwable) {
+                _uiState.updateChatComposerState { state ->
+                    if (state.composerAttachments.isEmpty() && draftsSnapshot.isNotEmpty()) {
+                        state.copy(composerAttachments = draftsSnapshot)
+                    } else {
+                        state
+                    }
+                }
+                handleUserMessageFailure(
+                    sessionId = sessionId,
+                    throwable = t
+                )
+            } finally {
+                generatingJob = null
+                syncGeneratingState()
+                loadSettingsIntoState()
+            }
+        }
+    }
+
+    fun stopGeneration(): Unit {
+        sessionCoordinator.stopGeneration()
+    }
+
+    fun loadOlderMessages(): Unit {
+        sessionCoordinator.loadOlderMessages()
+    }
+
+    private fun stopGenerationInternal() {
+        generatingJob?.cancel()
+    }
+
+    fun openSettings() {
+        loadSettingsIntoState()
+        refreshCronJobs()
+        _uiState.updateSettingsShellState { it.copy(info = null) }
+    }
+
+    fun showSettingsInfo(message: String) {
+        val text = message.trim()
+        if (text.isBlank()) return
+        _uiState.updateSettingsShellState { it.copy(info = text) }
+    }
+
+    fun clearProviderTokenUsageStats() = providerSettingsCoordinator.clearProviderTokenUsageStats()
+
+    fun clearSettingsInfo() {
+        _uiState.updateSettingsShellState {
+            if (it.info == null) it else it.copy(info = null)
+        }
+    }
+
+    private fun persistOnboardingProviderDraftIfNeeded() {
+        onboardingCoordinator.persistProviderDraftIfNeeded()
+    }
+
+    fun checkAppUpdate() = appUpdateCoordinator.checkAppUpdate()
+
+    fun dismissAppUpdatePrompt() = appUpdateCoordinator.dismissAppUpdatePrompt()
+    fun dismissAppUpdateNotice() = appUpdateCoordinator.dismissAppUpdateNotice()
+    fun notifyAppUpdateDownloadStarted() = appUpdateCoordinator.notifyAppUpdateDownloadStarted()
+
+    fun notifyAppUpdateDownloadFallback(releaseUrl: String) =
+        appUpdateCoordinator.notifyAppUpdateDownloadFallback(releaseUrl)
+
+    fun onSettingsProviderChanged(value: String) =
+        providerSettingsCoordinator.onSettingsProviderChanged(value)
+
+    fun startNewProviderDraft() = providerSettingsCoordinator.startNewProviderDraft()
+
+    fun selectProviderConfigForEditing(configId: String) =
+        providerSettingsCoordinator.selectProviderConfigForEditing(configId)
+
+    fun setActiveProviderConfig(configId: String) =
+        providerSettingsCoordinator.setActiveProviderConfig(configId)
+
+    private fun setActiveProviderConfigInternal(configId: String) {
+        val targetId = configId.trim()
+        if (targetId.isBlank() || _uiState.settingsShellState.value.saving) return
+        viewModelScope.launch {
+            _uiState.updateProviderSettingsState { it.copy(saving = true, info = null) }
+            runCatching {
+                val currentState = _uiState.providerSettingsState.value
+                val updatedConfigs = ProviderSettingsMapper.normalizeActiveProviderConfigs(
+                    currentState.providerConfigs.map { config ->
+                        config.copy(enabled = config.id == targetId)
+                    }
+                )
+                val selected = updatedConfigs.firstOrNull { it.id == targetId }
+                val updatedState = currentState.copy(
+                    providerConfigs = updatedConfigs,
+                    editingProviderConfigId = selected?.id.orEmpty(),
+                    provider = selected?.providerName ?: currentState.provider,
+                    providerCustomName = selected?.customName ?: currentState.providerCustomName,
+                    providerProtocol = selected?.providerProtocol ?: currentState.providerProtocol,
+                    baseUrl = selected?.let { config ->
+                        config.baseUrl.ifBlank {
+                            ProviderCatalog.defaultBaseUrl(config.providerName, config.providerProtocol)
+                        }
+                    } ?: currentState.baseUrl,
+                    model = selected?.model ?: currentState.model,
+                    apiKeyDraft = selected?.apiKey ?: currentState.apiKeyDraft
+                )
+                configStore.saveConfig(
+                    ProviderSettingsMapper.buildSettingsConfig(configStore.getConfig(), updatedState)
+                )
+                updatedState
+            }.onSuccess { updatedState ->
+                _uiState.updateProviderSettingsState {
+                    it.copy(
+                        saving = false,
+                        providerConfigs = updatedState.providerConfigs,
+                        editingProviderConfigId = updatedState.editingProviderConfigId,
+                        provider = updatedState.provider,
+                        providerCustomName = updatedState.providerCustomName,
+                        providerProtocol = updatedState.providerProtocol,
+                        baseUrl = updatedState.baseUrl,
+                        model = updatedState.model,
+                        apiKeyDraft = updatedState.apiKeyDraft,
+                        info = "Provider updated."
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateProviderSettingsState {
+                    it.copy(
+                        saving = false,
+                        info = "Save failed: ${t.message ?: t.javaClass.simpleName}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun deleteProviderConfig(configId: String) =
+        providerSettingsCoordinator.deleteProviderConfig(configId)
+
+    private fun deleteProviderConfigInternal(configId: String) {
+        val targetId = configId.trim()
+        if (targetId.isBlank() || _uiState.settingsShellState.value.saving) return
+        viewModelScope.launch {
+            _uiState.updateProviderSettingsState { it.copy(saving = true, info = null) }
+            runCatching {
+                val currentState = _uiState.providerSettingsState.value
+                val normalizedRemaining = ProviderSettingsMapper.normalizeActiveProviderConfigs(
+                    currentState.providerConfigs.filterNot { it.id == targetId }
+                )
+                val nextSelection = normalizedRemaining.firstOrNull()
+                val updatedState = currentState.copy(
+                    providerConfigs = normalizedRemaining,
+                    editingProviderConfigId = nextSelection?.id.orEmpty(),
+                    provider = nextSelection?.providerName ?: AppLimits.DEFAULT_PROVIDER,
+                    providerCustomName = nextSelection?.customName.orEmpty(),
+                    providerProtocol = nextSelection?.providerProtocol
+                        ?: ProviderCatalog.defaultProtocol(AppLimits.DEFAULT_PROVIDER),
+                    baseUrl = nextSelection?.let { config ->
+                        config.baseUrl.ifBlank {
+                            ProviderCatalog.defaultBaseUrl(config.providerName, config.providerProtocol)
+                        }
+                    } ?: ProviderCatalog.defaultBaseUrl(
+                        AppLimits.DEFAULT_PROVIDER,
+                        ProviderCatalog.defaultProtocol(AppLimits.DEFAULT_PROVIDER)
+                    ),
+                    model = nextSelection?.model ?: ProviderCatalog.defaultModel(
+                        AppLimits.DEFAULT_PROVIDER,
+                        ProviderCatalog.defaultProtocol(AppLimits.DEFAULT_PROVIDER)
+                    ),
+                    apiKeyDraft = nextSelection?.apiKey.orEmpty()
+                )
+                val cachePrefix = ProviderResolutionStore.cachePrefixForProviderConfig(targetId)
+                AdaptiveLlmProvider.clearRememberedTargets(cachePrefix)
+                providerResolutionStore.clearByPrefix(cachePrefix)
+                configStore.saveConfig(
+                    ProviderSettingsMapper.buildSettingsConfig(configStore.getConfig(), updatedState)
+                )
+                updatedState
+            }.onSuccess { updatedState ->
+                _uiState.updateProviderSettingsState {
+                    it.copy(
+                        saving = false,
+                        providerConfigs = updatedState.providerConfigs,
+                        editingProviderConfigId = updatedState.editingProviderConfigId,
+                        provider = updatedState.provider,
+                        providerCustomName = updatedState.providerCustomName,
+                        providerProtocol = updatedState.providerProtocol,
+                        baseUrl = updatedState.baseUrl,
+                        model = updatedState.model,
+                        apiKeyDraft = updatedState.apiKeyDraft,
+                        info = "Provider removed."
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateProviderSettingsState {
+                    it.copy(
+                        saving = false,
+                        info = "Save failed: ${t.message ?: t.javaClass.simpleName}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun onSettingsModelChanged(value: String) =
+        providerSettingsCoordinator.onSettingsModelChanged(value)
+
+    fun onSettingsProviderCustomNameChanged(value: String) =
+        providerSettingsCoordinator.onSettingsProviderCustomNameChanged(value)
+
+    fun onSettingsApiKeyChanged(value: String) =
+        providerSettingsCoordinator.onSettingsApiKeyChanged(value)
+
+    fun onSettingsBaseUrlChanged(value: String) =
+        providerSettingsCoordinator.onSettingsBaseUrlChanged(value)
+
+    fun onSettingsMaxRoundsChanged(value: String) =
+        providerSettingsCoordinator.onSettingsMaxRoundsChanged(value)
+
+    fun onSettingsToolResultMaxCharsChanged(value: String) =
+        providerSettingsCoordinator.onSettingsToolResultMaxCharsChanged(value)
+
+    fun onSettingsMemoryConsolidationWindowChanged(value: String) =
+        providerSettingsCoordinator.onSettingsMemoryConsolidationWindowChanged(value)
+
+    fun onSettingsLlmCallTimeoutSecondsChanged(value: String) =
+        providerSettingsCoordinator.onSettingsLlmCallTimeoutSecondsChanged(value)
+
+    fun onSettingsLlmConnectTimeoutSecondsChanged(value: String) =
+        providerSettingsCoordinator.onSettingsLlmConnectTimeoutSecondsChanged(value)
+
+    fun onSettingsLlmReadTimeoutSecondsChanged(value: String) =
+        providerSettingsCoordinator.onSettingsLlmReadTimeoutSecondsChanged(value)
+
+    fun onSettingsDefaultToolTimeoutSecondsChanged(value: String) =
+        providerSettingsCoordinator.onSettingsDefaultToolTimeoutSecondsChanged(value)
+
+    fun onSettingsContextMessagesChanged(value: String) =
+        providerSettingsCoordinator.onSettingsContextMessagesChanged(value)
+
+    fun onSettingsToolArgsPreviewMaxCharsChanged(value: String) =
+        providerSettingsCoordinator.onSettingsToolArgsPreviewMaxCharsChanged(value)
+
+    fun onToolEnabledChanged(toolName: String, enabled: Boolean) =
+        toolSettingsCoordinator.onToolEnabledChanged(toolName, enabled)
+
+    fun onSearchProviderChanged(provider: SearchProviderId) =
+        toolSettingsCoordinator.onSearchProviderChanged(provider)
+
+    fun onSearchBraveApiKeyChanged(value: String) =
+        toolSettingsCoordinator.onSearchBraveApiKeyChanged(value)
+
+    fun onSearchTavilyApiKeyChanged(value: String) =
+        toolSettingsCoordinator.onSearchTavilyApiKeyChanged(value)
+
+    fun onSearchJinaApiKeyChanged(value: String) =
+        toolSettingsCoordinator.onSearchJinaApiKeyChanged(value)
+
+    fun onSearchKagiApiKeyChanged(value: String) =
+        toolSettingsCoordinator.onSearchKagiApiKeyChanged(value)
+
+    fun onSkillEnabledChanged(skillName: String, enabled: Boolean) =
+        skillSettingsCoordinator.onSkillEnabledChanged(skillName, enabled)
+
+    fun onSkillAllowIncompatibleChanged(skillName: String, allowIncompatible: Boolean) =
+        skillSettingsCoordinator.onSkillAllowIncompatibleChanged(skillName, allowIncompatible)
+
+    fun selectInstalledSkill(skillName: String) {
+        skillSettingsCoordinator.selectInstalledSkill(skillName)
+        refreshSelectedInstalledSkillDetail()
+    }
+
+    fun clearInstalledSkillSelection() =
+        skillSettingsCoordinator.clearInstalledSkillSelection()
+
+    fun saveSkillSettings(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) = skillSettingsCoordinator.saveSkillSettings(showSuccessMessage, showErrorMessage)
+
+    fun refreshSkillCatalog() {
+        viewModelScope.launch {
+            refreshSkillCatalogInternal(loadBrowse = false)
+        }
+    }
+
+    fun refreshClawHubBrowse() {
+        val query = _uiState.skillsDiscoveryState.value.clawHubSearchQuery.trim()
+        if (query.isNotBlank()) {
+            searchClawHubSkills()
+            return
+        }
+        viewModelScope.launch {
+            refreshSkillCatalogInternal(loadBrowse = true)
+        }
+    }
+
+    fun onClawHubSearchQueryChanged(query: String) {
+        _uiState.updateSkillsState {
+            it.copy(
+                clawHubSearchQuery = query,
+                clawHubSearchedQuery = if (query.trim().isBlank()) "" else it.clawHubSearchedQuery,
+                clawHubSearchResults = if (query.trim().isBlank()) emptyList() else it.clawHubSearchResults
+            )
+        }
+    }
+
+    fun searchClawHubSkills() {
+        val query = _uiState.skillsDiscoveryState.value.clawHubSearchQuery.trim()
+        if (query.isBlank()) {
+            _uiState.updateSkillsState {
+                it.copy(
+                    clawHubSearchedQuery = "",
+                    clawHubSearchResults = emptyList()
+                )
+            }
+            return
+        }
+        viewModelScope.launch {
+            _uiState.updateSkillsState {
+                it.copy(
+                    clawHubLoading = true
+                )
+            }
+            _uiState.updateSettingsShellState { it.copy(info = null) }
+            runCatching {
+                withContext(Dispatchers.IO) { skillRepository.searchSkills(query) }
+            }.onSuccess { results ->
+                _uiState.updateSkillsState { state ->
+                    if (state.clawHubSearchQuery.trim() == query) {
+                        state.copy(
+                            clawHubLoading = false,
+                            clawHubSearchedQuery = query,
+                            clawHubSearchResults = results.map(SkillSettingsMapper::toUiClawHubCard)
+                        )
+                    } else {
+                        state.copy(clawHubLoading = false)
+                    }
+                }
+            }.onFailure { t ->
+                _uiState.updateSkillsState {
+                    it.copy(clawHubLoading = false)
+                }
+                _uiState.updateSettingsShellState {
+                    it.copy(info = "ClawHub search failed: ${t.message ?: t.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    fun openClawHubSkillDetail(detailUrl: String) {
+        val normalizedUrl = detailUrl.trim()
+        if (normalizedUrl.isBlank()) return
+        viewModelScope.launch {
+            _uiState.updateSkillsState {
+                it.copy(
+                    clawHubLoading = true
+                )
+            }
+            _uiState.updateSettingsShellState { it.copy(info = null) }
+            runCatching {
+                withContext(Dispatchers.IO) { skillRepository.fetchSkillDetail(normalizedUrl) }
+            }.onSuccess { detail ->
+                _uiState.updateSkillsState {
+                    it.copy(
+                        clawHubLoading = false,
+                        selectedClawHubDetail = SkillSettingsMapper.toUiClawHubDetail(detail)
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateSkillsState {
+                    it.copy(clawHubLoading = false)
+                }
+                _uiState.updateSettingsShellState {
+                    it.copy(info = "ClawHub detail failed: ${t.message ?: t.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    fun clearClawHubSkillDetail() {
+        _uiState.updateSkillsState {
+            it.copy(selectedClawHubDetail = null)
+        }
+    }
+
+    fun stageClawHubSkillInstall(detailUrl: String) =
+        skillSettingsCoordinator.stageClawHubSkillInstall(detailUrl)
+
+    fun stageLocalSkillImport(uriString: String) =
+        skillSettingsCoordinator.stageLocalSkillImport(uriString)
+
+    fun dismissStagedSkillReview() =
+        skillSettingsCoordinator.dismissStagedSkillReview()
+
+    fun confirmStagedSkillInstall() =
+        skillSettingsCoordinator.confirmStagedSkillInstall()
+
+    fun deleteInstalledSkill(skillName: String) =
+        skillSettingsCoordinator.deleteInstalledSkill(skillName)
+
+    fun onSettingsCronEnabledChanged(value: Boolean) =
+        runtimeCoordinator.onSettingsCronEnabledChanged(value)
+
+    fun onSettingsCronMinEveryMsChanged(value: String) =
+        runtimeCoordinator.onSettingsCronMinEveryMsChanged(value)
+
+    fun onSettingsCronMaxJobsChanged(value: String) =
+        runtimeCoordinator.onSettingsCronMaxJobsChanged(value)
+
+    fun onSettingsHeartbeatEnabledChanged(value: Boolean) =
+        runtimeCoordinator.onSettingsHeartbeatEnabledChanged(value)
+
+    fun onSettingsHeartbeatIntervalSecondsChanged(value: String) =
+        runtimeCoordinator.onSettingsHeartbeatIntervalSecondsChanged(value)
+
+    fun onSettingsGatewayEnabledChanged(value: Boolean) =
+        runtimeCoordinator.onSettingsGatewayEnabledChanged(value)
+
+    fun setUiLanguage(useChinese: Boolean) {
+        val current = configStore.getUiPreferencesConfig()
+        val next = current.copy(useChinese = useChinese)
+        configStore.saveUiPreferencesConfig(next)
+        val onboardingState = _uiState.onboardingUiState.value
+        val fallbackUserName = if (useChinese) "你" else "You"
+        val currentDefaultUserName = if (onboardingState.useChinese) "你" else "You"
+        val adjustedOnboardingUserName = when {
+            onboardingState.completed -> onboardingState.onboardingUserDisplayName
+            onboardingState.onboardingUserDisplayName.isBlank() -> fallbackUserName
+            onboardingState.onboardingUserDisplayName == currentDefaultUserName -> fallbackUserName
+            else -> onboardingState.onboardingUserDisplayName
+        }
+        _uiState.updateSettingsShellState {
+            it.copy(useChinese = next.useChinese)
+        }
+        _uiState.updateOnboardingUiState {
+            it.copy(
+                useChinese = next.useChinese,
+                onboardingUserDisplayName = adjustedOnboardingUserName
+            )
+        }
+        _uiState.updateIdentityDisplayState {
+            it.copy(useChinese = next.useChinese)
+        }
+    }
+
+    fun toggleUiLanguage() {
+        setUiLanguage(!configStore.getUiPreferencesConfig().useChinese)
+    }
+
+    fun toggleUiTheme() {
+        val current = configStore.getUiPreferencesConfig()
+        val next = current.copy(darkTheme = !current.darkTheme)
+        configStore.saveUiPreferencesConfig(next)
+        _uiState.updateSettingsShellState {
+            it.copy(darkTheme = next.darkTheme)
+        }
+    }
+
+    fun onOnboardingUserDisplayNameChanged(value: String) =
+        onboardingCoordinator.onUserDisplayNameChanged(value)
+
+    fun onOnboardingAgentDisplayNameChanged(value: String) =
+        onboardingCoordinator.onAgentDisplayNameChanged(value)
+
+    fun completeOnboarding() = onboardingCoordinator.completeOnboarding()
+
+    fun onSettingsTelegramBotTokenChanged(value: String) =
+        runtimeCoordinator.onSettingsTelegramBotTokenChanged(value)
+
+    fun onSettingsTelegramAllowedChatIdChanged(value: String) =
+        runtimeCoordinator.onSettingsTelegramAllowedChatIdChanged(value)
+
+    fun onSettingsDiscordWebhookUrlChanged(value: String) =
+        runtimeCoordinator.onSettingsDiscordWebhookUrlChanged(value)
+
+    fun onSettingsMcpEnabledChanged(value: Boolean) =
+        runtimeCoordinator.onSettingsMcpEnabledChanged(value)
+
+    fun onSettingsMcpServerNameChanged(value: String) =
+        runtimeCoordinator.onSettingsMcpServerNameChanged(value)
+
+    fun onSettingsMcpServerUrlChanged(value: String) =
+        runtimeCoordinator.onSettingsMcpServerUrlChanged(value)
+
+    fun onSettingsMcpAuthTokenChanged(value: String) =
+        runtimeCoordinator.onSettingsMcpAuthTokenChanged(value)
+
+    fun onSettingsMcpToolTimeoutSecondsChanged(value: String) =
+        runtimeCoordinator.onSettingsMcpToolTimeoutSecondsChanged(value)
+
+    fun addSettingsMcpServer() = runtimeCoordinator.addSettingsMcpServer()
+
+    fun removeSettingsMcpServer(serverId: String) =
+        runtimeCoordinator.removeSettingsMcpServer(serverId)
+
+    fun updateSettingsMcpServerName(serverId: String, value: String) =
+        runtimeCoordinator.updateSettingsMcpServerName(serverId, value)
+
+    fun updateSettingsMcpServerUrl(serverId: String, value: String) =
+        runtimeCoordinator.updateSettingsMcpServerUrl(serverId, value)
+
+    fun updateSettingsMcpServerAuthToken(serverId: String, value: String) =
+        runtimeCoordinator.updateSettingsMcpServerAuthToken(serverId, value)
+
+    fun updateSettingsMcpServerTimeout(serverId: String, value: String) =
+        runtimeCoordinator.updateSettingsMcpServerTimeout(serverId, value)
+
+    fun updateSettingsMcpInsecureHttpAllowedOrigin(serverId: String, origin: String?) =
+        runtimeCoordinator.updateSettingsMcpInsecureHttpAllowedOrigin(serverId, origin)
+
+    fun refreshCronJobs() = runtimeCoordinator.refreshCronJobs()
+
+    private fun refreshCronJobsInternal() {
+        viewModelScope.launch {
+            _uiState.updateAutomationState { it.copy(cronJobsLoading = true) }
+            runCatching { withContext(Dispatchers.IO) { cronService.listJobs(includeDisabled = true) } }
+                .onSuccess { jobs ->
+                    _uiState.updateAutomationState {
+                        it.copy(
+                            cronJobsLoading = false,
+                            cronJobs = jobs.map { job -> job.toUiCronJob() }
+                        )
+                    }
+                }
+                .onFailure { t ->
+                    _uiState.updateAutomationState {
+                        it.copy(cronJobsLoading = false)
+                    }
+                    _uiState.updateSettingsShellState {
+                        it.copy(info = "Load cron jobs failed: ${t.message ?: t.javaClass.simpleName}")
+                    }
+                }
+        }
+    }
+
+    fun setCronJobEnabled(jobId: String, enabled: Boolean) =
+        runtimeCoordinator.setCronJobEnabled(jobId, enabled)
+
+    private fun setCronJobEnabledInternal(jobId: String, enabled: Boolean) {
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { cronService.enableJob(jobId, enabled) } }
+                .onSuccess { refreshCronJobs() }
+                .onFailure { t ->
+                    _uiState.updateSettingsShellState {
+                        it.copy(info = "Update cron job failed: ${t.message ?: t.javaClass.simpleName}")
+                    }
+                }
+        }
+    }
+
+    fun runCronJobNow(jobId: String) = runtimeCoordinator.runCronJobNow(jobId)
+
+    private fun runCronJobNowInternal(jobId: String) {
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { cronService.runJob(jobId, force = true) } }
+                .onSuccess { refreshCronJobs() }
+                .onFailure { t ->
+                    _uiState.updateSettingsShellState {
+                        it.copy(info = "Run cron job failed: ${t.message ?: t.javaClass.simpleName}")
+                    }
+                }
+        }
+    }
+
+    fun removeCronJob(jobId: String) = runtimeCoordinator.removeCronJob(jobId)
+
+    private fun removeCronJobInternal(jobId: String) {
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { cronService.removeJob(jobId) } }
+                .onSuccess { refreshCronJobs() }
+                .onFailure { t ->
+                    _uiState.updateSettingsShellState {
+                        it.copy(info = "Remove cron job failed: ${t.message ?: t.javaClass.simpleName}")
+                    }
+                }
+        }
+    }
+
+
+    fun selectSession(sessionId: String): Unit {
+        sessionCoordinator.selectSession(sessionId)
+    }
+
+    fun createSession(displayName: String): Unit {
+        sessionCoordinator.createSession(displayName)
+    }
+
+    private fun createSessionInternal(displayName: String) {
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    chatRepository.createSession(displayName)
+                }
+            }.onSuccess { sid ->
+                selectSession(sid)
+                _uiState.updateSettingsShellState { it.copy(info = "Session created.") }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(info = "Create session failed: ${t.message ?: t.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    fun renameSession(sessionId: String, displayName: String): Unit {
+        sessionCoordinator.renameSession(sessionId, displayName)
+    }
+
+    private fun renameSessionInternal(sessionId: String, displayName: String) {
+        val sid = sessionId.trim()
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    chatRepository.renameSession(sid, displayName)
+                }
+            }.onSuccess {
+                if (currentSessionId == sid) {
+                    _uiState.updateSessionListState { it.copy(currentSessionTitle = displayName.trim()) }
+                }
+                _uiState.updateSettingsShellState { it.copy(info = "Session renamed.") }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(info = "Rename session failed: ${t.message ?: t.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    fun deleteSession(sessionId: String): Unit {
+        sessionCoordinator.deleteSession(sessionId)
+    }
+
+    private fun deleteSessionInternal(sessionId: String) {
+        val sid = sessionId.trim()
+        viewModelScope.launch {
+            runCatching {
+                if (currentSessionId == sid) {
+                    stopGenerationAndAwaitCompletion()
+                }
+                withContext(Dispatchers.IO) {
+                    chatRepository.deleteSession(sid)
+                }
+            }.onSuccess {
+                if (currentSessionId == sid) {
+                    selectSession(AppSession.LOCAL_SESSION_ID)
+                }
+                refreshSessionBindingsInState()
+                _uiState.updateSettingsShellState { it.copy(info = "Session deleted.") }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(info = "Delete session failed: ${t.message ?: t.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    private suspend fun stopGenerationAndAwaitCompletion() {
+        val job = generatingJob ?: return
+        job.cancel()
+        runCatching { job.join() }
+    }
+
+    @Suppress("LongParameterList")
+    fun saveSessionChannelBinding(
+        sessionId: String,
+        enabled: Boolean = true,
+        channel: String,
+        chatId: String,
+        targetDisplayName: String = "",
+        telegramBotToken: String = "",
+        telegramAllowedChatId: String = "",
+        discordBotToken: String = "",
+        discordResponseMode: String = "mention",
+        discordAllowedUserIds: String = "",
+        slackBotToken: String = "",
+        slackAppToken: String = "",
+        slackResponseMode: String = "mention",
+        slackAllowedUserIds: String = "",
+        feishuAppId: String = "",
+        feishuAppSecret: String = "",
+        feishuEncryptKey: String = "",
+        feishuVerificationToken: String = "",
+        feishuResponseMode: String = "mention",
+        feishuAllowedOpenIds: String = "",
+        emailConsentGranted: Boolean = false,
+        emailImapHost: String = "",
+        emailImapPort: String = "993",
+        emailImapUsername: String = "",
+        emailImapPassword: String = "",
+        emailSmtpHost: String = "",
+        emailSmtpPort: String = "587",
+        emailSmtpUsername: String = "",
+        emailSmtpPassword: String = "",
+        emailFromAddress: String = "",
+        emailAutoReplyEnabled: Boolean = true,
+        wecomBotId: String = "",
+        wecomSecret: String = "",
+        wecomAllowedUserIds: String = ""
+    ) = channelBindingCoordinator.saveSessionChannelBinding(
+        sessionId = sessionId,
+        enabled = enabled,
+        channel = channel,
+        chatId = chatId,
+        targetDisplayName = targetDisplayName,
+        telegramBotToken = telegramBotToken,
+        telegramAllowedChatId = telegramAllowedChatId,
+        discordBotToken = discordBotToken,
+        discordResponseMode = discordResponseMode,
+        discordAllowedUserIds = discordAllowedUserIds,
+        slackBotToken = slackBotToken,
+        slackAppToken = slackAppToken,
+        slackResponseMode = slackResponseMode,
+        slackAllowedUserIds = slackAllowedUserIds,
+        feishuAppId = feishuAppId,
+        feishuAppSecret = feishuAppSecret,
+        feishuEncryptKey = feishuEncryptKey,
+        feishuVerificationToken = feishuVerificationToken,
+        feishuResponseMode = feishuResponseMode,
+        feishuAllowedOpenIds = feishuAllowedOpenIds,
+        emailConsentGranted = emailConsentGranted,
+        emailImapHost = emailImapHost,
+        emailImapPort = emailImapPort,
+        emailImapUsername = emailImapUsername,
+        emailImapPassword = emailImapPassword,
+        emailSmtpHost = emailSmtpHost,
+        emailSmtpPort = emailSmtpPort,
+        emailSmtpUsername = emailSmtpUsername,
+        emailSmtpPassword = emailSmtpPassword,
+        emailFromAddress = emailFromAddress,
+        emailAutoReplyEnabled = emailAutoReplyEnabled,
+        wecomBotId = wecomBotId,
+        wecomSecret = wecomSecret,
+        wecomAllowedUserIds = wecomAllowedUserIds
+    )
+
+    fun getSessionChannelDraft(sessionId: String): UiSessionChannelDraft =
+        channelBindingCoordinator.getSessionChannelDraft(sessionId)
+
+    fun setSessionChannelEnabled(sessionId: String, enabled: Boolean) =
+        channelBindingCoordinator.setSessionChannelEnabled(sessionId, enabled)
+
+    private fun setSessionChannelEnabledInternalFacade(sessionId: String, enabled: Boolean) {
+        val sid = sessionId.trim()
+        if (sid.isBlank()) return
+        viewModelScope.launch {
+            runCatching {
+                runtimeControlService.setChannelEnabled(
+                    update = ChannelBindingUpdate(sessionId = sid, enabled = enabled),
+                    refreshPort = runtimeControlRefreshPort,
+                    snapshotSource = channelRuntimeSnapshotSource
+                )
+            }.onSuccess {
+                _uiState.updateSettingsShellState {
+                    it.copy(info = if (enabled) "Session channel enabled." else "Session channel disabled.")
+                }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(info = "Update session channel switch failed: ${t.message ?: t.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    fun discoverTelegramChatsForBinding(botToken: String) =
+        channelBindingCoordinator.discoverTelegramChatsForBinding(botToken)
+
+    private fun discoverTelegramChatsForBindingInternal(botToken: String) {
+        launchChannelDiscovery {
+            applyChannelDiscoveryPresentation(ChannelDiscoveryStateProjector::telegramLoading)
+            when (val outcome = channelDiscoveryService.discoverTelegram(TelegramDiscoveryRequest(botToken))) {
+                is ChannelDiscoveryOutcome.Completed -> {
+                    val candidates = outcome.candidates.map { candidate ->
+                        UiTelegramChatCandidate(candidate.chatId, candidate.title, candidate.kind)
+                    }
+                    applyChannelDiscoveryPresentation { state ->
+                        ChannelDiscoveryStateProjector.telegramCompleted(state, candidates)
+                    }
+                }
+                is ChannelDiscoveryOutcome.Failed -> applyChannelDiscoveryPresentation { state ->
+                    if (outcome.kind == ChannelDiscoveryFailureKind.INVALID_INPUT) {
+                        ChannelDiscoveryStateProjector.telegramMissingToken(state)
+                    } else {
+                        ChannelDiscoveryStateProjector.telegramFailed(state, outcome.message)
+                    }
+                }
+            }
+        }
+    }
+
+    fun clearTelegramChatDiscovery() = channelBindingCoordinator.clearTelegramChatDiscovery()
+
+    private fun clearTelegramChatDiscoveryInternal() {
+        cancelChannelDiscovery()
+        _uiState.updateSessionBindingState(ChannelDiscoveryStateProjector::telegramCleared)
+    }
+
+    fun discoverFeishuChatsForBinding(
+        appId: String,
+        appSecret: String,
+        encryptKey: String,
+        verificationToken: String
+    ) = channelBindingCoordinator.discoverFeishuChatsForBinding(
+        appId = appId,
+        appSecret = appSecret,
+        encryptKey = encryptKey,
+        verificationToken = verificationToken
+    )
+
+    private fun discoverFeishuChatsForBindingInternal(
+        appId: String,
+        appSecret: String,
+        encryptKey: String,
+        verificationToken: String
+    ) {
+        launchChannelDiscovery {
+            applyChannelDiscoveryPresentation(ChannelDiscoveryStateProjector::feishuLoading)
+            val currentBinding = channelBindingService.getSessionChannelBindings()
+                .firstOrNull { binding ->
+                    binding.sessionId.trim() == currentSessionId.trim() &&
+                        binding.enabled &&
+                        binding.channel.trim().equals("feishu", ignoreCase = true)
+                }
+            val outcome = channelDiscoveryService.discoverFeishu(
+                request = FeishuDiscoveryRequest(appId, appSecret, encryptKey, verificationToken),
+                currentBinding = currentBinding
+            )
+            applyChannelDiscoveryPresentation { state ->
+                when (outcome) {
+                    is ChannelDiscoveryOutcome.Completed -> ChannelDiscoveryStateProjector.feishuCompleted(
+                        currentState = state,
+                        candidates = outcome.candidates.map { candidate ->
+                            UiFeishuChatCandidate(candidate.chatId, candidate.title, candidate.kind, candidate.note)
+                        },
+                        info = outcome.info
+                    )
+                    is ChannelDiscoveryOutcome.Failed -> ChannelDiscoveryStateProjector.feishuCompleted(
+                        currentState = state,
+                        candidates = outcome.fallbackCandidates.map { candidate ->
+                            UiFeishuChatCandidate(candidate.chatId, candidate.title, candidate.kind, candidate.note)
+                        },
+                        info = outcome.message
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearFeishuChatDiscovery() = channelBindingCoordinator.clearFeishuChatDiscovery()
+
+    private fun clearFeishuChatDiscoveryInternal() {
+        cancelChannelDiscovery()
+        _uiState.updateSessionBindingState(ChannelDiscoveryStateProjector::feishuCleared)
+    }
+
+    fun discoverEmailSendersForBinding(
+        consentGranted: Boolean,
+        imapHost: String,
+        imapPort: String,
+        imapUsername: String,
+        imapPassword: String,
+        smtpHost: String,
+        smtpPort: String,
+        smtpUsername: String,
+        smtpPassword: String,
+        fromAddress: String,
+        autoReplyEnabled: Boolean
+    ) = channelBindingCoordinator.discoverEmailSendersForBinding(
+        consentGranted = consentGranted,
+        imapHost = imapHost,
+        imapPort = imapPort,
+        imapUsername = imapUsername,
+        imapPassword = imapPassword,
+        smtpHost = smtpHost,
+        smtpPort = smtpPort,
+        smtpUsername = smtpUsername,
+        smtpPassword = smtpPassword,
+        fromAddress = fromAddress,
+        autoReplyEnabled = autoReplyEnabled
+    )
+
+    private fun discoverEmailSendersForBindingInternal(
+        consentGranted: Boolean,
+        imapHost: String,
+        imapPort: String,
+        imapUsername: String,
+        imapPassword: String,
+        smtpHost: String,
+        smtpPort: String,
+        smtpUsername: String,
+        smtpPassword: String,
+        fromAddress: String,
+        autoReplyEnabled: Boolean
+    ) {
+        launchChannelDiscovery {
+            applyChannelDiscoveryPresentation(ChannelDiscoveryStateProjector::emailLoading)
+            val outcome = channelDiscoveryService.discoverEmail(
+                EmailDiscoveryRequest(
+                    consentGranted = consentGranted,
+                    imapHost = imapHost,
+                    imapPort = imapPort,
+                    imapUsername = imapUsername,
+                    imapPassword = imapPassword,
+                    smtpHost = smtpHost,
+                    smtpPort = smtpPort,
+                    smtpUsername = smtpUsername,
+                    smtpPassword = smtpPassword,
+                    fromAddress = fromAddress,
+                    autoReplyEnabled = autoReplyEnabled
+                )
+            )
+            applyChannelDiscoveryPresentation { state ->
+                when (outcome) {
+                    is ChannelDiscoveryOutcome.Completed -> ChannelDiscoveryStateProjector.emailCompleted(
+                        currentState = state,
+                        candidates = outcome.candidates.map { candidate ->
+                            UiEmailSenderCandidate(candidate.email, candidate.subject, candidate.note)
+                        }
+                    )
+                    is ChannelDiscoveryOutcome.Failed -> ChannelDiscoveryStateProjector.emailFailed(
+                        currentState = state,
+                        fallbackCandidates = outcome.fallbackCandidates.map { candidate ->
+                            UiEmailSenderCandidate(candidate.email, candidate.subject, candidate.note)
+                        },
+                        message = outcome.message
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearEmailSenderDiscovery() = channelBindingCoordinator.clearEmailSenderDiscovery()
+
+    private fun clearEmailSenderDiscoveryInternal() {
+        cancelChannelDiscovery()
+        _uiState.updateSessionBindingState(ChannelDiscoveryStateProjector::emailCleared)
+    }
+
+    fun discoverWeComChatsForBinding(botId: String, secret: String) =
+        channelBindingCoordinator.discoverWeComChatsForBinding(botId, secret)
+
+    private fun discoverWeComChatsForBindingInternal(botId: String, secret: String) {
+        launchChannelDiscovery {
+            applyChannelDiscoveryPresentation(ChannelDiscoveryStateProjector::weComLoading)
+            val outcome = channelDiscoveryService.discoverWeCom(WeComDiscoveryRequest(botId, secret))
+            applyChannelDiscoveryPresentation { state ->
+                when (outcome) {
+                    is ChannelDiscoveryOutcome.Completed -> ChannelDiscoveryStateProjector.weComCompleted(
+                        currentState = state,
+                        candidates = outcome.candidates.map { candidate ->
+                            UiWeComChatCandidate(candidate.chatId, candidate.title, candidate.kind, candidate.note)
+                        },
+                        info = outcome.info
+                    )
+                    is ChannelDiscoveryOutcome.Failed -> {
+                        if (outcome.kind == ChannelDiscoveryFailureKind.INVALID_INPUT) {
+                            ChannelDiscoveryStateProjector.weComMissingCredentials(state)
+                        } else {
+                            ChannelDiscoveryStateProjector.weComCompleted(
+                                currentState = state,
+                                candidates = outcome.fallbackCandidates.map { candidate ->
+                                    UiWeComChatCandidate(
+                                        candidate.chatId,
+                                        candidate.title,
+                                        candidate.kind,
+                                        candidate.note
+                                    )
+                                },
+                                info = outcome.message
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun clearWeComChatDiscovery() = channelBindingCoordinator.clearWeComChatDiscovery()
+
+    private fun clearWeComChatDiscoveryInternal() {
+        cancelChannelDiscovery()
+        _uiState.updateSessionBindingState(ChannelDiscoveryStateProjector::weComCleared)
+    }
+
+    fun triggerHeartbeatNow() = runtimeCoordinator.triggerHeartbeatNow()
+
+    private fun triggerHeartbeatNowInternal() {
+        viewModelScope.launch {
+            runCatching { runtimeControlService.triggerHeartbeat(heartbeatRuntimePort) }
+                .onSuccess { result ->
+                    _uiState.updateSettingsShellState { it.copy(info = result) }
+                }
+                .onFailure { t ->
+                    _uiState.updateSettingsShellState {
+                        it.copy(info = t.message ?: t.javaClass.simpleName)
+                    }
+                }
+        }
+    }
+
+    fun loadHeartbeatDocument() = runtimeCoordinator.loadHeartbeatDocument()
+
+    private fun loadHeartbeatDocumentInternal() {
+        viewModelScope.launch {
+            val text = withContext(Dispatchers.IO) { readHeartbeatDoc() }
+            _uiState.updateAutomationState { it.copy(heartbeatDoc = text) }
+        }
+    }
+
+    fun onSettingsHeartbeatDocChanged(value: String) =
+        runtimeCoordinator.onSettingsHeartbeatDocChanged(value)
+
+    fun saveHeartbeatDocument(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) = runtimeCoordinator.saveHeartbeatDocument(showSuccessMessage, showErrorMessage)
+
+    private fun saveHeartbeatDocumentInternal(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) {
+        viewModelScope.launch {
+            val content = _uiState.automationSettingsState.value.heartbeatDoc
+            runCatching {
+                runtimeControlService.updateHeartbeat(
+                    update = HeartbeatUpdate(documentContent = content),
+                    refreshPort = runtimeControlRefreshPort,
+                    heartbeatPort = heartbeatRuntimePort
+                )
+                loadSettingsIntoState()
+            }.onSuccess {
+                _uiState.updateSettingsShellState {
+                    it.copy(info = if (showSuccessMessage) "HEARTBEAT.md saved." else null)
+                }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        info = if (showErrorMessage) {
+                            "Save HEARTBEAT.md failed: ${t.message ?: t.javaClass.simpleName}"
+                        } else {
+                            null
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    fun refreshCronLogs() = runtimeCoordinator.refreshCronLogs()
+
+    private fun refreshCronLogsInternal() {
+        viewModelScope.launch {
+            val logs = withContext(Dispatchers.IO) { cronLogStore.readRecent() }
+            _uiState.updateAutomationState { it.copy(cronLogs = logs) }
+        }
+    }
+
+    fun clearCronLogs() = runtimeCoordinator.clearCronLogs()
+
+    private fun clearCronLogsInternal() {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { cronLogStore.clear() }
+            _uiState.updateAutomationState { it.copy(cronLogs = "") }
+            _uiState.updateSettingsShellState { it.copy(info = "Cron logs cleared.") }
+        }
+    }
+
+    fun refreshAgentLogs() = runtimeCoordinator.refreshAgentLogs()
+
+    private fun refreshAgentLogsInternal() {
+        viewModelScope.launch {
+            val logs = withContext(Dispatchers.IO) { agentLogStore.readRecent() }
+            _uiState.updateToolSettingsState { it.copy(agentLogs = logs) }
+        }
+    }
+
+    fun refreshSessionConnectionStatus() = channelBindingCoordinator.refreshSessionConnectionStatus()
+
+    private fun refreshSessionConnectionStatusInternal() {
+        refreshSessionBindingsInState()
+    }
+
+    fun clearAgentLogs() = runtimeCoordinator.clearAgentLogs()
+
+    private fun clearAgentLogsInternal() {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { agentLogStore.clear() }
+            _uiState.updateToolSettingsState { it.copy(agentLogs = "") }
+            _uiState.updateSettingsShellState { it.copy(info = "Agent logs cleared.") }
+        }
+    }
+
+    fun saveProviderSettings(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) = providerSettingsCoordinator.saveProviderSettings(showSuccessMessage, showErrorMessage)
+
+    fun saveToolSettings(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) = toolSettingsCoordinator.saveToolSettings(showSuccessMessage, showErrorMessage)
+
+    private fun saveSkillSettingsInternal(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) {
+        if (_uiState.settingsShellState.value.saving) return
+        viewModelScope.launch {
+            _uiState.updateSettingsShellState { it.copy(saving = true, info = null) }
+            runCatching {
+                val updatedConfig = buildSkillSettingsConfig(_uiState.skillsDiscoveryState.value)
+                configStore.saveConfig(updatedConfig)
+                runtimeRefreshGateway.refreshGatewayRuntimeConfig()
+            }.onSuccess {
+                loadSettingsIntoState()
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showSuccessMessage) "Skills saved." else null
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showErrorMessage) {
+                            "Save failed: ${t.message ?: t.javaClass.simpleName}"
+                        } else {
+                            null
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    private fun saveProviderSettingsInternal(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) {
+        if (_uiState.settingsShellState.value.saving) return
+        viewModelScope.launch {
+            _uiState.updateProviderSettingsState { it.copy(saving = true, info = null) }
+            runCatching {
+                val updatedState = ProviderSettingsMapper.buildStateWithSavedDraft(_uiState.providerSettingsState.value)
+                updatedState.editingProviderConfigId
+                    .takeIf { it.isNotBlank() }
+                    ?.let { configId ->
+                        val cachePrefix = ProviderResolutionStore.cachePrefixForProviderConfig(configId)
+                        AdaptiveLlmProvider.clearRememberedTargets(cachePrefix)
+                        providerResolutionStore.clearByPrefix(cachePrefix)
+                    }
+                configStore.saveConfig(
+                    ProviderSettingsMapper.buildSettingsConfig(configStore.getConfig(), updatedState)
+                )
+                updatedState
+            }.onSuccess { updatedState ->
+                _uiState.updateProviderSettingsState {
+                    it.copy(
+                        saving = false,
+                        providerConfigs = updatedState.providerConfigs,
+                        editingProviderConfigId = updatedState.editingProviderConfigId,
+                        provider = updatedState.provider,
+                        providerCustomName = updatedState.providerCustomName,
+                        providerProtocol = updatedState.providerProtocol,
+                        baseUrl = updatedState.baseUrl,
+                        model = updatedState.model,
+                        apiKeyDraft = updatedState.apiKeyDraft,
+                        info = if (showSuccessMessage) "Provider saved." else null
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateProviderSettingsState {
+                    it.copy(
+                        saving = false,
+                        info = if (showErrorMessage) {
+                            "Save failed: ${t.message ?: t.javaClass.simpleName}"
+                        } else {
+                            null
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    fun saveAgentRuntimeSettings(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) = providerSettingsCoordinator.saveAgentRuntimeSettings(showSuccessMessage, showErrorMessage)
+
+    private fun saveAgentRuntimeSettingsInternal(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) {
+        if (_uiState.settingsShellState.value.saving) return
+        viewModelScope.launch {
+            _uiState.updateSettingsShellState { it.copy(saving = true, info = null) }
+            runCatching {
+                val state = _uiState.toolSettingsState.value
+                runtimeControlService.updateRuntimeSettings(
+                    RuntimeSettingsUpdate(
+                        maxToolRounds = state.maxToolRounds.trim().toIntOrNull()
+                            ?: throw IllegalArgumentException("Max rounds must be a number"),
+                        toolResultMaxChars = state.toolResultMaxChars.trim().toIntOrNull()
+                            ?: throw IllegalArgumentException("Tool result max chars must be a number"),
+                        memoryConsolidationWindow = state.memoryConsolidationWindow.trim().toIntOrNull()
+                            ?: throw IllegalArgumentException("Memory consolidation window must be a number"),
+                        llmCallTimeoutSeconds = state.llmCallTimeoutSeconds.trim().toIntOrNull()
+                            ?: throw IllegalArgumentException("LLM call timeout must be a number"),
+                        llmConnectTimeoutSeconds = state.llmConnectTimeoutSeconds.trim().toIntOrNull()
+                            ?: throw IllegalArgumentException("LLM connect timeout must be a number"),
+                        llmReadTimeoutSeconds = state.llmReadTimeoutSeconds.trim().toIntOrNull()
+                            ?: throw IllegalArgumentException("LLM read timeout must be a number"),
+                        defaultToolTimeoutSeconds = state.defaultToolTimeoutSeconds.trim().toIntOrNull()
+                            ?: throw IllegalArgumentException("Default tool timeout must be a number"),
+                        contextMessages = state.contextMessages.trim().toIntOrNull()
+                            ?: throw IllegalArgumentException("Context messages must be a number"),
+                        toolArgsPreviewMaxChars = state.toolArgsPreviewMaxChars.trim().toIntOrNull()
+                            ?: throw IllegalArgumentException("Tool args preview max chars must be a number")
+                    )
+                )
+                loadSettingsIntoState()
+            }.onSuccess {
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showSuccessMessage) "Runtime saved." else null
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showErrorMessage) {
+                            "Save failed: ${t.message ?: t.javaClass.simpleName}"
+                        } else {
+                            null
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    fun saveCronSettings(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) = runtimeCoordinator.saveCronSettings(showSuccessMessage, showErrorMessage)
+
+    private fun saveCronSettingsInternal(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) {
+        if (_uiState.settingsShellState.value.saving) return
+        viewModelScope.launch {
+            _uiState.updateSettingsShellState { it.copy(saving = true, info = null) }
+            runCatching {
+                val state = _uiState.automationSettingsState.value
+                persistCronSettings(
+                    com.palmclaw.tools.CronConfigUpdate(
+                        enabled = state.cronEnabled,
+                        minEveryMs = state.cronMinEveryMs.trim().toLongOrNull()
+                            ?: throw IllegalArgumentException("Cron min interval ms must be a number"),
+                        maxJobs = state.cronMaxJobs.trim().toIntOrNull()
+                            ?: throw IllegalArgumentException("Cron max jobs must be a number")
+                    )
+                )
+            }.onSuccess {
+                refreshCronJobs()
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showSuccessMessage) "Cron saved." else null
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showErrorMessage) {
+                            "Save failed: ${t.message ?: t.javaClass.simpleName}"
+                        } else {
+                            null
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    fun saveHeartbeatSettings(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) = runtimeCoordinator.saveHeartbeatSettings(showSuccessMessage, showErrorMessage)
+
+    private fun saveHeartbeatSettingsInternal(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) {
+        if (_uiState.settingsShellState.value.saving) return
+        viewModelScope.launch {
+            _uiState.updateSettingsShellState { it.copy(saving = true, info = null) }
+            runCatching {
+                val state = _uiState.automationSettingsState.value
+                runtimeControlService.updateHeartbeat(
+                    update = HeartbeatUpdate(
+                        enabled = state.heartbeatEnabled,
+                        intervalSeconds = state.heartbeatIntervalSeconds.trim().toLongOrNull()
+                            ?: throw IllegalArgumentException("Heartbeat interval seconds must be a number")
+                    ),
+                    refreshPort = runtimeControlRefreshPort,
+                    heartbeatPort = heartbeatRuntimePort
+                )
+                loadSettingsIntoState()
+            }.onSuccess {
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showSuccessMessage) "Heartbeat saved." else null
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showErrorMessage) {
+                            "Save failed: ${t.message ?: t.javaClass.simpleName}"
+                        } else {
+                            null
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    fun onAlwaysOnEnabledChanged(value: Boolean) =
+        runtimeCoordinator.onAlwaysOnEnabledChanged(value)
+
+    fun onAlwaysOnKeepScreenAwakeChanged(value: Boolean) =
+        runtimeCoordinator.onAlwaysOnKeepScreenAwakeChanged(value)
+
+    fun saveAlwaysOnSettings(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) = runtimeCoordinator.saveAlwaysOnSettings(showSuccessMessage, showErrorMessage)
+
+    private fun saveAlwaysOnSettingsInternal(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) {
+        if (_uiState.settingsShellState.value.saving) return
+        viewModelScope.launch {
+            _uiState.updateSettingsShellState { it.copy(saving = true, info = null) }
+            runCatching {
+                val state = _uiState.alwaysOnSettingsState.value
+                val next = AlwaysOnConfig(
+                    enabled = state.enabled,
+                    keepScreenAwake = state.keepScreenAwake
+                )
+                runtimeExecutionGateway.applyAlwaysOnConfig(next)
+                refreshAlwaysOnDiagnostics()
+            }.onSuccess {
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showSuccessMessage) "Always-on mode settings saved." else null
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showErrorMessage) {
+                            "Save failed: ${t.message ?: t.javaClass.simpleName}"
+                        } else {
+                            null
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    fun refreshAlwaysOnDiagnostics() = runtimeCoordinator.refreshAlwaysOnDiagnostics()
+
+    private fun refreshAlwaysOnDiagnosticsInternal() {
+        val app = getApplication<Application>()
+        val status = runtimeStatusSource.currentAlwaysOnStatus()
+        val powerManager = app.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val batteryIntent = app.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val chargingStatus = batteryIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val isCharging = chargingStatus == BatteryManager.BATTERY_STATUS_CHARGING ||
+            chargingStatus == BatteryManager.BATTERY_STATUS_FULL
+        val ignoringOptimizations = powerManager?.let {
+            runCatching { it.isIgnoringBatteryOptimizations(app.packageName) }.getOrDefault(false)
+        } ?: false
+        _uiState.updateAlwaysOnState {
+            it.withRuntimeStatus(status).copy(
+                charging = isCharging,
+                batteryOptimizationIgnored = ignoringOptimizations
+            )
+        }
+    }
+
+    fun saveChannelsSettings(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) = runtimeCoordinator.saveChannelsSettings(showSuccessMessage, showErrorMessage)
+
+    private fun saveChannelsSettingsInternal(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) {
+        if (_uiState.settingsShellState.value.saving) return
+        viewModelScope.launch {
+            _uiState.updateSettingsShellState { it.copy(saving = true, info = null) }
+            runCatching {
+                val bindings = channelBindingService.getSessionChannelBindings()
+                val current = channelBindingService.getChannelsConfig()
+                val shouldEnableGateway = bindings.any(channelBindingRuntimeProjector::canStartAdapter)
+                val runtimeConfig = current.copy(enabled = shouldEnableGateway)
+                channelBindingService.saveChannelsConfig(runtimeConfig)
+                runtimeRefreshGateway.refreshGatewayRuntimeConfig()
+            }.onSuccess {
+                _uiState.updateChannelsSettingsState {
+                    it.copy(gatewayEnabled = channelBindingService.getChannelsConfig().enabled)
+                }
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showSuccessMessage) "Channels synced." else null
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showErrorMessage) {
+                            "Save failed: ${t.message ?: t.javaClass.simpleName}"
+                        } else {
+                            null
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    fun saveMcpSettings(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) = runtimeCoordinator.saveMcpSettings(showSuccessMessage, showErrorMessage)
+
+    private fun saveMcpSettingsInternal(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) {
+        if (_uiState.settingsShellState.value.saving) return
+        viewModelScope.launch {
+            _uiState.updateSettingsShellState { it.copy(saving = true, info = null) }
+            runCatching {
+                val state = _uiState.mcpSettingsState.value
+                val mcpConfig = McpSettingsMapper.buildConfig(state)
+                configStore.saveMcpHttpConfig(mcpConfig)
+                runtimeRefreshGateway.reloadMcp()
+            }.onSuccess {
+                // The previously cached snapshot belongs to the pre-save configuration.
+                // Render deterministic disconnected defaults until the lifecycle publishes
+                // the generation produced by this reload.
+                mcpServerStatuses = emptyMap()
+                _uiState.updateMcpSettingsState(SettingsStateAssembler::acknowledgeMcpSave)
+                loadSettingsIntoState()
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showSuccessMessage) "MCP saved." else null
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showErrorMessage) {
+                            "Save failed: ${t.message ?: t.javaClass.simpleName}"
+                        } else {
+                            null
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    fun testProviderSettings() = providerSettingsCoordinator.testProviderSettings()
+
+    private fun testProviderSettingsInternal() {
+        if (_uiState.providerSettingsState.value.providerTesting) return
+        viewModelScope.launch {
+            _uiState.updateProviderSettingsState { it.copy(providerTesting = true, info = null) }
+            runCatching {
+                val config = ProviderSettingsMapper.buildProviderTestConfig(
+                    current = configStore.getConfig(),
+                    state = _uiState.providerSettingsState.value
+                )
+                val provider = LlmProviderFactory(providerResolutionStore).create(config)
+                val response = withContext(Dispatchers.IO) {
+                    provider.chat(
+                        messages = listOf(
+                            ChatMessage(
+                                role = "user",
+                                content = "Reply with exactly OK."
+                            )
+                        ),
+                        toolsSpec = emptyList()
+                    )
+                }
+                val content = response.assistant.content.trim()
+                if (content.isBlank() && response.assistant.toolCalls.isEmpty()) {
+                    "Provider responded, but returned empty content."
+                } else {
+                    "Provider test passed."
+                }
+            }.onSuccess { result ->
+                _uiState.updateProviderSettingsState {
+                    it.copy(
+                        providerTesting = false,
+                        info = result
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateProviderSettingsState {
+                    it.copy(
+                        providerTesting = false,
+                        info = "Provider test failed: ${t.message ?: t.javaClass.simpleName}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun saveSettings() {
+        saveProviderSettings()
+    }
+
+    private fun maybeTriggerFirstRunAutoIntro() {
+        val onboardingState = _uiState.onboardingUiState.value
+        val timelineState = _uiState.chatTimelineState.value
+        val activeSessionId = currentSessionId.trim().ifBlank { AppSession.LOCAL_SESSION_ID }
+        if (!onboardingState.completed) return
+        if (activeSessionId != AppSession.LOCAL_SESSION_ID) return
+        if (configStore.hasCompletedFirstRunAutoIntro()) return
+        if (firstRunAutoIntroPending || generatingJob != null || timelineState.isGenerating) return
+
+        val text = if (onboardingState.useChinese) {
+            "请先简单介绍一下你自己，你现在能帮我做什么？"
+        } else {
+            "Please briefly introduce yourself. What can you help me with right now?"
+        }
+
+        firstRunAutoIntroPending = true
+        _uiState.updateChatTimelineState { it.copy(isGenerating = true) }
+        _uiState.updateChatComposerState { it.copy(isGenerating = true) }
+        generatingJob = viewModelScope.launch {
+            try {
+                runtimeExecutionGateway.runUserMessage(
+                    sessionId = AppSession.LOCAL_SESSION_ID,
+                    sessionTitle = AppSession.LOCAL_SESSION_TITLE,
+                    text = text
+                )
+                sessionCoordinator.refreshRecentMessages(AppSession.LOCAL_SESSION_ID)
+                configStore.markFirstRunAutoIntroCompleted()
+            } catch (t: CancellationException) {
+                throw t
+            } catch (t: Throwable) {
+                handleUserMessageFailure(
+                    sessionId = AppSession.LOCAL_SESSION_ID,
+                    throwable = t
+                )
+            } finally {
+                firstRunAutoIntroPending = false
+                generatingJob = null
+                syncGeneratingState()
+                loadSettingsIntoState()
+            }
+        }
+    }
+
+    override fun onCleared() {
+        sessionCoordinator.clear()
+        messageUiProjector.clearAll()
+        cancelChannelDiscovery()
+        generatingJob?.cancel()
+        generatingJob = null
+        super.onCleared()
+    }
+
+    private fun handleUserMessageFailure(sessionId: String, throwable: Throwable) {
+        Log.e(TAG, "Failed to run user message for session=$sessionId", throwable)
+        val message = throwable.message?.trim().takeUnless { it.isNullOrBlank() }
+            ?: throwable.javaClass.simpleName
+        _uiState.updateSettingsShellState {
+            it.copy(info = "Send message failed: $message")
+        }
+    }
+
+    private fun saveToolSettingsInternal(
+        showSuccessMessage: Boolean = true,
+        showErrorMessage: Boolean = true
+    ) {
+        if (_uiState.settingsShellState.value.saving) return
+        viewModelScope.launch {
+            _uiState.updateSettingsShellState { it.copy(saving = true, info = null) }
+            runCatching {
+                val updatedConfig = buildToolSettingsConfig(_uiState.toolSettingsState.value)
+                configStore.saveConfig(updatedConfig)
+                runtimeRefreshGateway.refreshToolRuntimeConfig()
+                updatedConfig
+            }.onSuccess {
+                loadSettingsIntoState()
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showSuccessMessage) "Tools saved." else null
+                    )
+                }
+            }.onFailure { t ->
+                _uiState.updateSettingsShellState {
+                    it.copy(
+                        saving = false,
+                        info = if (showErrorMessage) {
+                            "Save failed: ${t.message ?: t.javaClass.simpleName}"
+                        } else {
+                            null
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    private fun bootstrapLocalSessions() {
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    chatRepository.ensureLocalSessionExists()
+                }
+            }.onFailure { t ->
+                Log.e(TAG, "Failed to bootstrap local session", t)
+            }
+        }
+    }
+
+    private suspend fun mapMessagesToUi(sessionId: String, messages: List<MessageEntity>): List<UiMessage> {
+        return withContext(Dispatchers.Default) {
+            messageUiProjector.projectSessionMessages(sessionId, messages)
+        }
+    }
+
+    private fun MessageAttachment.toUiAttachment(): UiAttachment {
+        return UiAttachment(
+            reference = reference,
+            kind = when (kind) {
+                com.palmclaw.bus.MessageAttachmentKind.Image -> UiAttachmentKind.Image
+                com.palmclaw.bus.MessageAttachmentKind.Video -> UiAttachmentKind.Video
+                com.palmclaw.bus.MessageAttachmentKind.Audio -> UiAttachmentKind.Audio
+                com.palmclaw.bus.MessageAttachmentKind.File -> UiAttachmentKind.File
+            },
+            label = label,
+            mimeType = mimeType,
+            sizeBytes = sizeBytes,
+            source = source,
+            transferState = transferState,
+            failureMessage = failureMessage,
+            isRemoteBacked = isRemoteBacked,
+            localWorkspacePath = localWorkspacePath
+        )
+    }
+
+    private fun UiAttachment.toMessageAttachment(): MessageAttachment {
+        return MessageAttachment(
+            reference = reference,
+            kind = when (kind) {
+                UiAttachmentKind.Image -> com.palmclaw.bus.MessageAttachmentKind.Image
+                UiAttachmentKind.Video -> com.palmclaw.bus.MessageAttachmentKind.Video
+                UiAttachmentKind.Audio -> com.palmclaw.bus.MessageAttachmentKind.Audio
+                UiAttachmentKind.File -> com.palmclaw.bus.MessageAttachmentKind.File
+            },
+            label = label,
+            mimeType = mimeType,
+            sizeBytes = sizeBytes,
+            source = source,
+            transferState = transferState,
+            failureMessage = failureMessage,
+            localWorkspacePath = localWorkspacePath,
+            isRemoteBacked = isRemoteBacked
+        )
+    }
+
+    private fun buildSessionSummaries(raw: List<SessionEntity>): List<UiSessionSummary> {
+        val bindingsBySession = channelBindingService.getSessionChannelBindings()
+            .associateBy { it.sessionId.trim() }
+        return UiSessionSummaryProjector.build(
+            rawSessions = raw,
+            bindingsBySession = bindingsBySession
+        )
+    }
+
+    private fun refreshSessionBindingsInState() {
+        val bindingsBySession = channelBindingService.getSessionChannelBindings()
+            .associateBy { it.sessionId.trim() }
+        val sessions = UiSessionSummaryProjector.applyBindings(
+            sessions = _uiState.sessionListState.value.sessions,
+            bindingsBySession = bindingsBySession
+        )
+        _uiState.updateSessionListState {
+            it.copy(sessions = sessions)
+        }
+        _uiState.updateChannelsSettingsState {
+            it.copy(connectedChannels = buildConnectedChannelsOverview(sessions))
+        }
+    }
+
+    private fun startGatewayIfEnabled() {
+        viewModelScope.launch {
+            runtimeExecutionGateway.startGatewayIfEnabled()
+        }
+    }
+
+    private fun onGatewayProcessingUpdate(result: GatewayProcessingCoordinator.UpdateResult) {
+        if (result.shouldRefreshGateway) {
+            viewModelScope.launch {
+                runtimeRefreshGateway.refreshGatewayRuntimeConfig()
+            }
+        }
+        syncGeneratingState()
+    }
+
+    private fun buildUiBuiltInTools(config: com.palmclaw.config.AppConfig): List<UiBuiltInToolConfig> {
+        return BuiltInToolCatalog.all()
+            .sortedWith(compareBy({ it.category }, { it.displayName.lowercase(Locale.US) }))
+            .map { descriptor ->
+                UiBuiltInToolConfig(
+                    toolName = descriptor.toolName,
+                    displayName = descriptor.displayName,
+                    description = descriptor.description,
+                    category = descriptor.category,
+                    enabled = BuiltInToolCatalog.isEnabled(config, descriptor.toolName),
+                    enabledByDefault = descriptor.enabledByDefault,
+                    supportsSettings = descriptor.supportsSettings,
+                    settingsKind = descriptor.settingsKind,
+                    userManageable = descriptor.userManageable
+                )
+            }
+    }
+
+    private fun buildUiInstalledSkills(): List<UiSkillConfig> {
+        return skillRepository.listSkills()
+            .sortedWith(compareBy({ it.source.wireValue }, { it.displayName.lowercase(Locale.US) }))
+            .map(SkillSettingsMapper::toUiSkillConfig)
+    }
+
+    private fun buildToolSettingsConfig(state: ToolSettingsState): com.palmclaw.config.AppConfig {
+        val current = configStore.getConfig()
+        return current.copy(
+            toolToggles = state.builtInTools
+                .filter { it.userManageable }
+                .associate { it.toolName to it.enabled },
+            searchProvider = state.searchProvider,
+            searchProviderConfigs = SearchProviderConfigs(
+                braveApiKey = state.searchBraveApiKey.trim(),
+                tavilyApiKey = state.searchTavilyApiKey.trim(),
+                jinaApiKey = state.searchJinaApiKey.trim(),
+                kagiApiKey = state.searchKagiApiKey.trim()
+            )
+        )
+    }
+
+    private fun buildSkillSettingsConfig(state: SkillsDiscoveryState): com.palmclaw.config.AppConfig {
+        val current = configStore.getConfig()
+        return current.copy(
+            skillStates = state.installedSkills.associate { skill ->
+                skill.name to com.palmclaw.config.SkillUserState(
+                    enabled = skill.enabled,
+                    allowIncompatible = skill.allowIncompatible
+                )
+            }
+        )
+    }
+
+    private fun refreshMcpServersInState(config: McpHttpConfig = configStore.getMcpHttpConfig()) {
+        val uiServers = McpSettingsMapper.buildUiServers(
+            config = config,
+            runtimeStatuses = mcpServerStatuses
+        )
+        val first = uiServers.firstOrNull()
+        _uiState.updateMcpSettingsState {
+            it.copy(
+                enabled = config.enabled,
+                serverName = first?.serverName ?: AppLimits.DEFAULT_MCP_HTTP_SERVER_NAME,
+                serverUrl = first?.serverUrl.orEmpty(),
+                authToken = first?.authToken.orEmpty(),
+                toolTimeoutSeconds = first?.toolTimeoutSeconds
+                    ?: AppLimits.DEFAULT_MCP_HTTP_TOOL_TIMEOUT_SECONDS.toString(),
+                servers = uiServers,
+                hasUnsavedChanges = false
+            )
+        }
+    }
+
+    private fun onMcpRuntimeSnapshotChanged(snapshot: com.palmclaw.mcp.McpRuntimeSnapshot) {
+        mcpServerStatuses = McpSettingsMapper.runtimeStatuses(snapshot)
+        _uiState.updateMcpSettingsState { state ->
+            McpSettingsMapper.applyRuntimeSnapshot(state, snapshot)
+        }
+    }
+
+    private fun onGatewaySessionProcessingChanged(sessionId: String, processing: Boolean) {
+        onGatewayProcessingUpdate(
+            gatewayProcessingCoordinator.updateLocalProcessingSession(
+                sessionId = sessionId,
+                processing = processing
+            )
+        )
+    }
+
+    private fun requestGatewayRuntimeRefresh() {
+        if (gatewayProcessingCoordinator.requestGatewayRefresh()) {
+            viewModelScope.launch {
+                runtimeRefreshGateway.refreshGatewayRuntimeConfig()
+            }
+        }
+    }
+
+    private fun computeIsGeneratingForSession(sessionId: String): Boolean {
+        if (generatingJob != null) return true
+        return gatewayProcessingCoordinator.isSessionProcessing(sessionId)
+    }
+
+    private fun syncGeneratingState() {
+        val activeSessionId = currentSessionId.trim().ifBlank { AppSession.LOCAL_SESSION_ID }
+        val busy = computeIsGeneratingForSession(activeSessionId)
+        _uiState.updateChatTimelineState { state ->
+            if (state.isGenerating == busy) state else state.copy(isGenerating = busy)
+        }
+        _uiState.updateChatComposerState { state ->
+            if (state.isGenerating == busy) state else state.copy(isGenerating = busy)
+        }
+    }
+
+    private fun resolveGatewaySessionBinding(message: InboundMessage): String? {
+        val c = message.channel.trim().lowercase(Locale.US)
+        val targetIds = when (c) {
+            "discord" -> listOf(normalizeDiscordChannelId(message.chatId))
+            "slack" -> listOf(normalizeSlackChannelId(message.chatId))
+            "feishu" -> buildFeishuTargetAliases(
+                primaryTargetId = message.chatId,
+                sourceChatId = message.metadata["source_chat_id"].orEmpty(),
+                senderOpenId = message.metadata["sender_open_id"].orEmpty()
+            )
+            "email" -> listOf(normalizeEmailAddress(message.chatId))
+            "wecom" -> listOf(normalizeWeComTargetId(message.chatId))
+            else -> listOf(message.chatId.trim())
+        }
+            .filter { it.isNotBlank() }
+        if (c.isBlank() || targetIds.isEmpty()) return null
+        val adapterKey = message.metadata[GatewayOrchestrator.KEY_ADAPTER_KEY]
+            ?.trim()
+            ?.ifBlank { null }
+        val bindings = channelBindingService.getSessionChannelBindings()
+        val exact = bindings.firstOrNull {
+            val channelMatches = it.enabled && it.channel.trim().lowercase(Locale.US) == c
+            if (!channelMatches) return@firstOrNull false
+            if (it.chatId.trim() !in targetIds) return@firstOrNull false
+            if (adapterKey == null) return@firstOrNull false
+            ChannelAdapterIdentity.keysForBinding(it).contains(adapterKey)
+        }
+        if (exact != null) {
+            return exact.sessionId.trim().ifBlank { null }
+        }
+        val fallback = bindings.firstOrNull {
+            val channelMatches = it.enabled && it.channel.trim().lowercase(Locale.US) == c
+            channelMatches && it.chatId.trim() in targetIds
+        }
+        return fallback?.sessionId?.trim()?.ifBlank { null }
+    }
+
+    private fun buildConnectedChannelsOverview(sessions: List<UiSessionSummary>): List<UiConnectedChannelSummary> {
+        val gatewayEnabled = channelBindingService.getChannelsConfig().enabled
+        return ConnectedChannelOverviewAssembler.build(
+            sessions = sessions,
+            bindings = channelBindingService.getSessionChannelBindings(),
+            projectionForBinding = { binding ->
+                channelBindingRuntimeProjector.project(
+                    binding = binding,
+                    gatewayEnabled = gatewayEnabled,
+                    snapshotSource = channelRuntimeSnapshotSource
+                )
+            }
+        )
+    }
+
+    private fun loadSettingsIntoState() {
+        val settingsInputs = buildSettingsStateInputs().copy(
+            connectedChannels = buildConnectedChannelsOverview(_uiState.sessionListState.value.sessions),
+            gatewayStatuses = gatewayStatusOverviewAssembler.build()
+        )
+        val slices = SettingsStateAssembler.assembleSlices(
+            currentShell = _uiState.settingsShellState.value,
+            currentAlwaysOn = _uiState.alwaysOnSettingsState.value,
+            currentMcp = _uiState.mcpSettingsState.value,
+            inputs = settingsInputs
+        )
+        _uiState.updateProviderSettingsState { slices.provider }
+        _uiState.updateToolSettingsState { slices.tool }
+        _uiState.updateSkillsState { slices.skills }
+        _uiState.updateAutomationState { slices.automation }
+        _uiState.updateAlwaysOnState { slices.alwaysOn }
+        _uiState.updateMcpSettingsState { slices.mcp }
+        _uiState.updateChannelsSettingsState { slices.channels }
+        _uiState.updateOnboardingUiState { slices.onboarding }
+        _uiState.updateIdentityDisplayState { slices.identity }
+        _uiState.updateSettingsShellState { slices.settingsShell }
+        refreshSelectedInstalledSkillDetail()
+    }
+
+    private suspend fun refreshSkillCatalogInternal(loadBrowse: Boolean) {
+        _uiState.updateSkillsState {
+            it.copy(
+                skillsLoading = true,
+                clawHubLoading = loadBrowse
+            )
+        }
+        _uiState.updateSettingsShellState { it.copy(info = null) }
+        runCatching {
+            val installedSkills = withContext(Dispatchers.IO) { buildUiInstalledSkills() }
+            val browse = if (loadBrowse) {
+                withContext(Dispatchers.IO) { skillRepository.fetchBrowseSections() }
+            } else {
+                null
+            }
+            installedSkills to browse
+        }.onSuccess { (installedSkills, browse) ->
+            _uiState.updateSkillsState { state ->
+                state.copy(
+                    skillsLoading = false,
+                    clawHubLoading = false,
+                    installedSkills = installedSkills,
+                    clawHubStaffPicks = browse?.first?.map(SkillSettingsMapper::toUiClawHubCard)
+                        ?: state.clawHubStaffPicks,
+                    clawHubPopular = browse?.second?.map(SkillSettingsMapper::toUiClawHubCard)
+                        ?: state.clawHubPopular
+                )
+            }
+            refreshSelectedInstalledSkillDetail()
+        }.onFailure { t ->
+            _uiState.updateSkillsState {
+                it.copy(
+                    skillsLoading = false,
+                    clawHubLoading = false
+                )
+            }
+            _uiState.updateSettingsShellState {
+                it.copy(info = "Skills refresh failed: ${t.message ?: t.javaClass.simpleName}")
+            }
+        }
+    }
+
+    private fun refreshSelectedInstalledSkillDetail() {
+        val selectedName = _uiState.skillsDiscoveryState.value.selectedSkillName.trim()
+        if (selectedName.isBlank()) {
+            _uiState.updateSkillsState { it.copy(selectedSkillDetail = null) }
+            return
+        }
+        val selected = _uiState.skillsDiscoveryState.value.installedSkills.firstOrNull { it.name == selectedName }
+        _uiState.updateSkillsState {
+            it.copy(
+                selectedSkillDetail = selected,
+                selectedSkillName = selected?.name.orEmpty()
+            )
+        }
+    }
+
+    private fun buildSettingsStateInputs(): SettingsStateAssembler.Inputs {
+        val config = configStore.getConfig()
+        val mcpConfig = configStore.getMcpHttpConfig()
+        return SettingsStateAssembler.Inputs(
+            appConfig = config,
+            cronConfig = configStore.getCronConfig(),
+            heartbeatConfig = configStore.getHeartbeatConfig(),
+            channelsConfig = channelBindingService.getChannelsConfig(),
+            alwaysOnConfig = configStore.getAlwaysOnConfig(),
+            uiPreferencesConfig = configStore.getUiPreferencesConfig(),
+            onboardingConfig = onboardingCoordinator.resolveSyncedOnboardingConfig(),
+            mcpConfig = mcpConfig,
+            tokenStats = configStore.getTokenUsageStats(),
+            providerConfigs = ProviderSettingsMapper.buildUiProviderConfigs(config),
+            builtInTools = buildUiBuiltInTools(config),
+            installedSkills = buildUiInstalledSkills(),
+            mcpServers = McpSettingsMapper.buildUiServers(
+                config = mcpConfig,
+                runtimeStatuses = mcpServerStatuses
+            ),
+            cronLogs = cronLogStore.readRecent(),
+            agentLogs = agentLogStore.readRecent()
+        )
+    }
+
+    private suspend fun persistCronSettings(
+        update: com.palmclaw.tools.CronConfigUpdate
+    ): CronConfig {
+        val current = configStore.getCronConfig()
+        val minEveryMs = update.minEveryMs ?: current.minEveryMs
+        if (minEveryMs !in AppLimits.MIN_CRON_MIN_EVERY_MS..AppLimits.MAX_CRON_MIN_EVERY_MS) {
+            throw IllegalArgumentException(
+                "Cron min interval ms must be between ${AppLimits.MIN_CRON_MIN_EVERY_MS} and ${AppLimits.MAX_CRON_MIN_EVERY_MS}"
+            )
+        }
+        val maxJobs = update.maxJobs ?: current.maxJobs
+        if (maxJobs !in AppLimits.MIN_CRON_MAX_JOBS..AppLimits.MAX_CRON_MAX_JOBS) {
+            throw IllegalArgumentException(
+                "Cron max jobs must be between ${AppLimits.MIN_CRON_MAX_JOBS} and ${AppLimits.MAX_CRON_MAX_JOBS}"
+            )
+        }
+        val config = CronConfig(
+            enabled = update.enabled ?: current.enabled,
+            minEveryMs = minEveryMs,
+            maxJobs = maxJobs
+        )
+        configStore.saveCronConfig(config)
+        runtimeRefreshGateway.reloadAutomation()
+        _uiState.updateAutomationState {
+            it.copy(
+                cronEnabled = config.enabled,
+                cronMinEveryMs = config.minEveryMs.toString(),
+                cronMaxJobs = config.maxJobs.toString()
+            )
+        }
+        return config
+    }
+
+    private fun CronJob.toUiCronJob(): UiCronJob {
+        return UiCronJob(
+            id = id,
+            name = name,
+            enabled = enabled,
+            schedule = when (schedule.kind) {
+                "every" -> "every ${schedule.everyMs?.div(1000L) ?: 0L}s"
+                "at" -> "at ${schedule.atMs?.let(::formatTimeMs).orEmpty()}"
+                "cron" -> schedule.expr ?: "cron"
+                else -> schedule.kind
+            },
+            nextRunAt = state.nextRunAtMs?.let(::formatTimeMs),
+            lastStatus = state.lastStatus,
+            lastError = state.lastError
+        )
+    }
+
+    private fun formatTimeMs(value: Long): String {
+        return runCatching {
+            SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date(value))
+        }.getOrElse { value.toString() }
+    }
+
+    private fun normalizeDiscordChannelId(raw: String): String {
+        return SessionChannelBindingRules.normalizeDiscordChannelId(raw)
+    }
+
+    private fun normalizeDiscordResponseMode(raw: String): String {
+        return SessionChannelBindingRules.normalizeDiscordResponseMode(raw)
+    }
+
+    private fun normalizeSlackChannelId(raw: String): String {
+        return SessionChannelBindingRules.normalizeSlackChannelId(raw)
+    }
+
+    private fun normalizeSlackResponseMode(raw: String): String {
+        return SessionChannelBindingRules.normalizeSlackResponseMode(raw)
+    }
+
+    private fun normalizeFeishuResponseMode(raw: String): String {
+        return SessionChannelBindingRules.normalizeFeishuResponseMode(raw)
+    }
+
+    private fun normalizeFeishuTargetId(raw: String): String {
+        return SessionChannelBindingRules.normalizeFeishuTargetId(raw)
+    }
+
+    private fun normalizeWeComTargetId(raw: String): String {
+        return SessionChannelBindingRules.normalizeWeComTargetId(raw)
+    }
+
+    private fun normalizeEmailAddress(raw: String): String {
+        return SessionChannelBindingRules.normalizeEmailAddress(raw)
+    }
+
+    private fun parseAllowedUserIds(raw: String): List<String> {
+        return SessionChannelBindingRules.parseAllowedIdentifiers(raw)
+    }
+
+    private fun isDiscordSnowflake(value: String): Boolean {
+        return SessionChannelBindingRules.isDiscordSnowflake(value)
+    }
+
+    private fun isSlackChannelId(value: String): Boolean {
+        return SessionChannelBindingRules.isSlackChannelId(value)
+    }
+
+    private fun isFeishuTargetId(value: String): Boolean {
+        return SessionChannelBindingRules.isFeishuTargetId(value)
+    }
+
+    private fun applyChannelDiscoveryPresentation(
+        presenter: (SessionBindingState) -> ChannelDiscoveryStateProjector.Presentation
+    ) {
+        val presentation = presenter(_uiState.sessionBindingState.value)
+        _uiState.updateSessionBindingState { presentation.state }
+        presentation.settingsInfo?.let(::showSettingsInfo)
+    }
+
+    private fun launchChannelDiscovery(block: suspend () -> Unit) {
+        val previous = channelDiscoveryJob
+        channelDiscoveryJob = viewModelScope.launch {
+            previous?.cancelAndJoin()
+            block()
+        }
+    }
+
+    private fun cancelChannelDiscovery() {
+        channelDiscoveryJob?.cancel()
+        channelDiscoveryJob = null
+    }
+
+    private fun runtimeToolArgsPreviewMaxChars(): Int {
+        return configStore.getConfig().toolArgsPreviewMaxChars.coerceIn(
+            AppLimits.MIN_TOOL_ARGS_PREVIEW_MAX_CHARS,
+            AppLimits.MAX_TOOL_ARGS_PREVIEW_MAX_CHARS
+        )
+    }
+
+    private fun readHeartbeatDoc(): String {
+        heartbeatDocFile.parentFile?.mkdirs()
+        if (!heartbeatDocFile.exists()) {
+            heartbeatDocFile.writeText(
+                templateStore.loadTemplate(HeartbeatDoc.FILE_NAME).orEmpty(),
+                Charsets.UTF_8
+            )
+        }
+        return runCatching {
+            heartbeatDocFile.readText(Charsets.UTF_8)
+        }.getOrDefault(templateStore.loadTemplate(HeartbeatDoc.FILE_NAME).orEmpty())
+    }
+
+    companion object {
+        private const val TAG = "ChatViewModel"
+        fun factory(application: Application): ViewModelProvider.Factory {
+            val container = AppContainer.from(application)
+            return object : ViewModelProvider.Factory {
+                override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                    @Suppress("UNCHECKED_CAST")
+                    return ChatViewModel(application, container) as T
+                }
+            }
+        }
+    }
+}
+
+private data class Quadruple<A, B, C, D>(
+    val first: A,
+    val second: B,
+    val third: C,
+    val fourth: D
+)
+
+private data class EmailCredentialKey(
+    val consentGranted: Boolean,
+    val imapHost: String,
+    val imapPort: Int,
+    val imapUsername: String,
+    val imapPassword: String,
+    val smtpHost: String,
+    val smtpPort: Int,
+    val smtpUsername: String,
+    val smtpPassword: String,
+    val fromAddress: String,
+    val autoReplyEnabled: Boolean
+)

@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">PalmClaw</string>
+    <string name="accessibility_label">PalmClaw Phone Control</string>
+    <string name="accessibility_description">Lets the PalmClaw agent read the screen and perform taps, swipes and text input to control your phone.</string>
+    <string name="channel_capture">Screen capture</string>
+    <string name="channel_capture_desc">Foreground service for on-demand screenshots</string>
+</resources>

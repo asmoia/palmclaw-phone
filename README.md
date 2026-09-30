@@ -1,0 +1,428 @@
+﻿<a name="readme-top"></a>
+
+<p align="right"><a href="./README.zh-CN.md">简体中文</a></p>
+
+<div align="center">
+  <h1>
+    <img src="./docs/assets/brand/PalmClaw-removebg-black.png#gh-light-mode-only" alt="PalmClaw Line Logo (light mode)" width="56" />
+    <img src="./docs/assets/brand/PalmClaw-removebg-preview.png#gh-dark-mode-only" alt="PalmClaw Line Logo (dark mode)" width="56" />
+    PalmClaw
+  </h1>
+  <p>An AI agent framework that runs natively on your Android phone.</p>
+</div>
+
+<div align="center">
+  <a href="https://modalitydance.github.io/PalmClaw/">
+    <img src="https://img.shields.io/badge/Project-Website-0A84FF?style=for-the-badge" alt="Project Website">
+  </a>
+  <a href="https://arxiv.org/abs/2607.13027">
+    <img src="https://img.shields.io/badge/arXiv-2607.13027-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv 2607.13027">
+  </a>
+  <a href="https://huggingface.co/papers/2607.13027">
+    <img src="https://img.shields.io/badge/Hugging%20Face-Papers-FFD21E?style=for-the-badge" alt="Hugging Face Papers">
+  </a>
+  <a href="https://github.com/ModalityDance/PalmClaw/releases/latest/download/app-release.apk">
+    <img src="https://img.shields.io/badge/Download-APK-f39c12?style=for-the-badge&logo=android&logoColor=white" alt="Download APK">
+  </a>
+  <a href="./docs/assets/site/weixingroup.jpg">
+    <img src="https://img.shields.io/badge/WeChat-Group-07C160?style=for-the-badge&logo=wechat&logoColor=white" alt="WeChat Open Source Group">
+  </a>
+  <a href="https://github.com/ModalityDance/PalmClaw/releases">
+    <img src="https://img.shields.io/github/downloads/ModalityDance/PalmClaw/total?style=for-the-badge&label=Release%20Downloads" alt="Release Downloads">
+  </a>
+  <img src="https://img.shields.io/badge/Tests-769-2ecc71?style=for-the-badge" alt="769 tests">
+  <img src="https://img.shields.io/badge/Platform-Android-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android">
+  <img src="https://img.shields.io/badge/Language-Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white" alt="Kotlin">
+</div>
+
+<p align="center"><strong>⬇️ Just want to download? <a href="#quick-start-download">Jump to Quick Start</a></strong></p>
+
+<a name="overview"></a>
+## 📌 Overview
+
+PalmClaw is an open-source agent framework inspired by [OpenClaw](https://github.com/openclaw/openclaw) and built to run directly on Android phones without a separate PC.
+
+It keeps sessions, context management, memory, skills, tools, and the agent loop on the device, while model inference comes from a user-configured LLM API.
+
+- 📱 Run and configure the agent directly in the Android app.
+- 🛠️ Access mobile capabilities through structured device tools.
+- 🔒 Keep actions controlled through schemas, permissions, confirmations, and workspace boundaries.
+
+<a name="key-features"></a>
+## ✨ Key Features
+
+- 📱 **On-device agent framework**  
+  Run sessions, context management, memory, skills, tools, and the agent loop directly on the phone.
+
+- 🛠️ **Structured device tools**  
+  Access files, personal data, hardware, web, communication, and automation through typed operations and structured results.
+
+- 🔐 **Explicit execution boundaries**  
+  Check schemas, Android permissions, user confirmations, and workspace paths before device actions are executed.
+
+- 🧠 **Persistent sessions and context**  
+  Keep conversation history, tool traces, attachments, session workspaces, and reusable memory across turns.
+
+- 📡 **Channels and automation**  
+  Receive tasks from local chat or connected channels, and run scheduled work through Cron, heartbeat, and Always-on mode.
+
+- 🔌 **Extensible integrations**  
+  Use built-in or custom LLM providers, MCP servers, and bundled or installed skills.
+
+
+<a name="demos"></a>
+## 🎬 Demos
+
+<div align="center">
+  <table width="100%">
+    <tr>
+      <td align="center"><img src="./docs/assets/site/demos/start.gif" alt="Initial Setup Demo" width="96%"></td>
+      <td align="center"><img src="./docs/assets/site/demos/func.gif" alt="Core Features Demo" width="96%"></td>
+      <td align="center"><img src="./docs/assets/site/demos/tool.gif" alt="Tool Usage Demo" width="96%"></td>
+      <td align="center"><img src="./docs/assets/site/demos/channel.gif" alt="Channels Configuration Demo" width="96%"></td>
+    </tr>
+    <tr>
+      <td align="center"><sub>Initial Setup</sub></td>
+      <td align="center"><sub>Core Features</sub></td>
+      <td align="center"><sub>Tool Usage</sub></td>
+      <td align="center"><sub>Channels Setup</sub></td>
+    </tr>
+  </table>
+</div>
+
+
+<a name="news"></a>
+## 📰 News
+
+
+- 🚀 **[2026.08.26] v0.3.1 Native Tools, Runtime Reliability & MCP Update:** Expanded workspace files and native tools; strengthened Cron, Always-on, channels, and MCP; improved provider endpoint compatibility and chat response timing; and increased coverage to 769 tests.
+- 🎉 **[2026.08.23] Paper Accepted!** We are happy to share that [PalmClaw: A Native On-Device Agent Framework for Mobile Phones](https://arxiv.org/abs/2607.13027) has been accepted to EMNLP 2026 System Demonstrations!
+- 📄 **[2026.07.16] Paper Release:** Our paper, [PalmClaw: A Native On-Device Agent Framework for Mobile Phones](https://arxiv.org/abs/2607.13027), is now available on arXiv.
+- 🚀 **[2026.06.16] v0.2.1 Runtime, Chat UX & Skills Update:** Unified the gateway runtime, improved per-session processing and chat scrolling, added ClawHub browsing and review flows, split major UI state, expanded channel/tool settings, and raised coverage to 306 tests.
+- 🎨 **[2026.04.06] v0.1.5 UI Refactor, Settings & Permissions Update:** Refined the UI and settings flow, unified permission handling, and fixed session, file, and MCP permission issues.
+- 📡 **[2026.03.28] v0.1.4 Channels, UI & Auto Update:** Improved channel stability, cleaned up UI details, and added automatic update checks and downloads.
+- 🔌 **[2026.03.25] v0.1.3 Custom Provider & Auto-Detect Update:** Added custom provider names and improved endpoint auto-detection.
+- ⚙️ **[2026.03.24] v0.1.2 Provider & Settings Refresh:** Added more provider presets and refined model setup and settings UX.
+- 🌏 **[2026.03.21] v0.1.1 Chinese Docs & UX Update:** Added a Chinese README, improved Chinese errors, and fixed the MiniMax endpoint.
+- 🚀 **[2026.03.16] Initial Release:** PalmClaw **v0.1.0** is now live! 🎉
+
+<a name="roadmap"></a>
+### 🛣️ Roadmap
+
+- [x] Improve engineering quality and expand test coverage.
+  - [x] Add a process-wide single runtime owner and keep Always-on as a foreground-service shell.
+  - [x] Add per-session turn coordination so long tasks in one session do not block all sessions.
+  - [x] Add a lightweight composition root and split major UI state into focused slices.
+  - [x] Add 769 unit/instrumentation tests across runtime, UI state, tools, channels, storage, providers, and skills.
+- [x] Improve tools.
+  - [x] Build a visual tool management page.
+  - [x] Add configurable web search providers.
+  - [x] Add immediate tool enable/disable behavior.
+- [x] Improve skills.
+  - [x] Build visual skill management for installed/local skills.
+  - [x] Integrate ClawHub browsing, search, download, and pre-install review.
+- [x] Improve chat UX and settings UX.
+  - [x] Add a startup screen for lightweight preloading.
+  - [x] Improve session switching, recent-message loading, older-history paging, and scroll stability.
+  - [x] Preserve settings page position when entering and leaving detail pages.
+- [ ] Continue skill work.
+  - [ ] Add visual skill editing.
+  - [ ] Support desktop skill -> mobile-ready skill conversion.
+- [ ] Add more channel integrations.
+- [ ] Expand Android-native capabilities.
+  - [ ] Enable automation through accessibility and screen capture.
+  - [ ] Add more local app integrations.
+  - [ ] Add an optional Termux Bridge for local command execution through a user-installed Termux app, with explicit opt-in, timeouts, output limits, and user confirmation for risky operations.
+- [ ] Continue improving the harness architecture and agent loop, inspired by Claude Code.
+
+
+
+<a name="table-of-contents"></a>
+## 📑 Table of Contents
+
+- [📌 Overview](#-overview)
+- [✨ Key Features](#-key-features)
+- [🎬 Demos](#-demos)
+- [📰 News](#-news)
+  - [🛣️ Roadmap](#️-roadmap)
+- [📑 Table of Contents](#-table-of-contents)
+- [🚀 Quick Start](#-quick-start)
+  - [👤 For Normal Users](#-for-normal-users)
+  - [🛠️ For Developers](#️-for-developers)
+- [🔌 Channels Configuration](#-channels-configuration)
+- [⚙️ How PalmClaw Works](#️-how-palmclaw-works)
+- [🗂️ Repository Structure](#️-repository-structure)
+- [🤝 Community](#-community)
+- [📝 Citation](#-citation)
+- [⚖️ License](#️-license)
+
+<a name="quick-start"></a>
+<a name="quick-start-download"></a>
+## 🚀 Quick Start
+
+<a name="for-normal-users"></a>
+### 👤 For Normal Users
+
+1. Download the latest APK from the [Releases page](https://github.com/ModalityDance/PalmClaw/releases).
+2. Install the APK on your Android phone.
+3. Open PalmClaw and follow the in-app onboarding guide.
+4. Finish provider setup, then start chatting in the local session!
+
+<div align="center">
+  <a href="https://github.com/ModalityDance/PalmClaw/releases/latest/download/app-release.apk">
+    <img src="./docs/assets/site/app-download-qr.png" alt="Scan to download PalmClaw APK" width="128" style="vertical-align: middle; border-radius: 4px;" />
+  </a>
+  &nbsp;&nbsp;
+  <a href="./docs/assets/site/weixingroup.jpg">
+    <img src="./docs/assets/site/weixingroup.jpg" alt="Join PalmClaw WeChat open source group" width="128" style="vertical-align: middle; border-radius: 4px;" />
+  </a>
+  <br />
+  <sub>Scan to download the latest APK</sub>
+  <sub>&nbsp;&nbsp;|&nbsp;&nbsp;</sub>
+  <sub>Scan to join the WeChat Group</sub>
+</div>
+
+> [!IMPORTANT]
+> PalmClaw does not include hosted model access by default. You need to configure your own provider API key during setup.
+
+<a name="for-developers"></a>
+### 🛠️ For Developers
+
+1. Install Android Studio and JDK 17.
+2. Clone the repository:
+
+```bash
+git clone https://github.com/ModalityDance/PalmClaw.git
+cd PalmClaw
+```
+
+3. Open the project in Android Studio and wait for Gradle sync.
+4. Ensure `local.properties` points to your Android SDK path.
+5. Run the app on a physical device or emulator.
+
+> [!NOTE]
+> `local.properties` is machine-specific and should not be committed.
+
+<a name="channels-configuration"></a>
+## 🔌 Channels Configuration
+
+PalmClaw currently supports these channels:
+
+<details>
+<summary><strong>Telegram</strong></summary>
+
+1. Set `Channel = Telegram`.
+2. Fill `Telegram Bot Token` and save.
+3. Send one message to your bot in Telegram.
+4. Tap `Detect Chats`.
+5. Select detected chat, then save binding.
+
+</details>
+
+<details>
+<summary><strong>Discord</strong></summary>
+
+1. Set `Channel = Discord`.
+2. Fill `Discord Bot Token`.
+3. Set target `Discord Channel ID`.
+4. Choose response mode (`mention` or `open`), optionally set allowed user IDs.
+5. Save binding.
+
+> [!TIP]
+> Invite the bot to the target server/channel first.
+>
+> If using `mention` mode, mention the bot once to trigger replies in guild channels.
+
+</details>
+
+<details>
+<summary><strong>Slack</strong></summary>
+
+1. Set `Channel = Slack`.
+2. Fill `Slack App Token (xapp...)` and `Slack Bot Token (xoxb...)`.
+3. Set target `Slack Channel ID`.
+4. Choose response mode (`mention` or `open`), optionally set allowed user IDs.
+5. Save binding.
+
+> [!IMPORTANT]
+> Slack prerequisites:
+>
+> - Socket Mode enabled
+> - App token with `connections:write`
+> - Bot token with required message/reply scopes
+
+</details>
+
+<details>
+<summary><strong>Feishu</strong></summary>
+
+1. Set `Channel = Feishu`.
+2. Fill `Feishu App ID` and `Feishu App Secret`, then save once in PalmClaw.
+3. In Feishu Open Platform, make sure Bot capability is enabled. In `Events & Callbacks`, select `Long Connection`, then add `im.message.receive_v1`.
+4. In `Permission Management`, add `im:message` (send messages) and `im:message.p2p_msg:readonly` (receive messages). If you test by `@`-mentioning the bot in a group, also add `im:message.group_at_msg:readonly`.
+5. Publish the app, open it in Feishu, and confirm the `Long Connection` configuration while PalmClaw is still running.
+6. Send one message to the bot from Feishu.
+7. Tap `Detect Chats`.
+8. Select detected target (`open_id` for private chat, `chat_id` for group), then save again.
+9. Optional: set `Allowed Open IDs`.
+
+> If outbound works but inbound does not, the usual cause is that the receive permission, event subscription, publish/open step, or Long Connection confirmation is still incomplete.
+
+</details>
+
+<details>
+<summary><strong>Email</strong></summary>
+
+1. Set `Channel = Email`.
+2. Enable consent.
+3. Fill IMAP settings: host, port, username, password.
+4. Fill SMTP settings: host, port, username, password, from address.
+5. Save once to start mailbox polling.
+6. Send one email to this mailbox from target sender.
+7. Tap `Detect Senders`.
+8. Select sender and save again.
+9. Optional: toggle auto-reply on/off.
+
+</details>
+
+<details>
+<summary><strong>WeCom</strong></summary>
+
+1. Set `Channel = WeCom`.
+2. Fill `WeCom Bot ID` and `WeCom Secret`.
+3. Save once to start long connection.
+4. Send one message to the bot from WeCom.
+5. Tap `Detect Chats`.
+6. Select detected target and save again.
+7. Optional: set `Allowed User IDs`.
+
+</details>
+
+> [!NOTE]
+> Recommended order for any channel:
+>
+> 1. Open the target session.
+> 2. Go to `Session Settings` -> `Channels & Configuration`.
+> 3. Select channel type and follow the setup instructions.
+<a name="how-palmclaw-works"></a>
+## ⚙️ How PalmClaw Works
+
+<div align="center">
+  <img src="./docs/assets/site/architecture.png" alt="PalmClaw architecture overview" width="800">
+</div>
+
+- 📩 **Message in**: input comes from local chat or connected channels.
+- 🤖 **Agent loop**: LLM decides, calls tools when needed, then generates response.
+- 🧠 **Context**: memory + skills guide every turn.
+- 📤 **Response out**: result is written to the session and sent back to the channels.
+
+<a name="repository-structure"></a>
+## 🗂️ Repository Structure
+
+```text
+PalmClaw/
+├─ app/
+│  ├─ src/main/java/com/palmclaw/
+│  │  ├─ agent/             # context construction and agent loop
+│  │  ├─ runtime/           # runtime ownership, control, Always-on, automation
+│  │  ├─ tools/             # built-in tools and Android platform gateways
+│  │  ├─ mcp/               # MCP transport, lifecycle, and capabilities
+│  │  ├─ channels/          # remote messaging channel adapters
+│  │  ├─ providers/         # LLM protocols and endpoint resolution
+│  │  ├─ storage/           # Room database and repositories
+│  │  ├─ workspace/         # session workspaces and path boundaries
+│  │  ├─ memory/            # persistent agent memory
+│  │  ├─ skills/            # skill loading and compatibility
+│  │  ├─ ui/                # Compose UI and UI coordinators
+│  │  └─ ...                # config, cron, heartbeat, attachments, and bus
+│  ├─ src/main/assets/      # templates and bundled skills
+│  ├─ src/test/             # JVM unit tests
+│  └─ src/androidTest/      # Android instrumentation tests
+├─ docs/
+│  ├─ engineering/          # architecture, roadmap, and testing guidance
+│  └─ assets/               # brand, site, and promotional assets
+├─ gradle/                  # Gradle wrapper files
+├─ README.md
+└─ README.zh-CN.md
+```
+
+<a name="community"></a>
+## 🤝 Community
+
+We welcome researchers, builders, and mobile AI practitioners to join the PalmClaw community. 🌍
+
+
+<div align="center">
+
+**Thanks to all contributors.**
+
+<a href="https://github.com/ModalityDance/PalmClaw/contributors">
+  <img src="https://contrib.rocks/image?repo=ModalityDance/PalmClaw" alt="Contributors" />
+</a>
+
+<br/><br/>
+
+<a href="https://www.star-history.com/?repos=ModalityDance%2FPalmClaw&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ModalityDance/PalmClaw&type=date&theme=dark&legend=top-left&sealed_token=ts2i77HAoVe3yV1ykgAXYA_NejEbBqFQa9T_xNJ3E0bQcypOJFcM3VAR8rFiZZmptsxIqporh2ygxWZkCzlr78uIT9WxHIbHT3BBAjTmSAeVgcUDF1yFxw" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ModalityDance/PalmClaw&type=date&legend=top-left&sealed_token=ts2i77HAoVe3yV1ykgAXYA_NejEbBqFQa9T_xNJ3E0bQcypOJFcM3VAR8rFiZZmptsxIqporh2ygxWZkCzlr78uIT9WxHIbHT3BBAjTmSAeVgcUDF1yFxw" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=ModalityDance/PalmClaw&type=date&legend=top-left&sealed_token=ts2i77HAoVe3yV1ykgAXYA_NejEbBqFQa9T_xNJ3E0bQcypOJFcM3VAR8rFiZZmptsxIqporh2ygxWZkCzlr78uIT9WxHIbHT3BBAjTmSAeVgcUDF1yFxw" />
+ </picture>
+</a>
+</div>
+
+
+<a name="citation"></a>
+## 📝 Citation
+
+If you find PalmClaw useful in your research, please cite our paper:
+
+```bibtex
+@misc{cai2026palmclawnativeondeviceagent,
+      title={PalmClaw: A Native On-Device Agent Framework for Mobile Phones},
+      author={Hongru Cai and Yongqi Li and Ran Wei and Wenjie Li},
+      year={2026},
+      eprint={2607.13027},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2607.13027},
+}
+```
+
+
+<a name="license"></a>
+## ⚖️ License
+
+This project is offered under a **dual licensing model**:
+
+- **Open Source License**: See [LICENSE](LICENSE)  
+  This is the default license for the project. It ensures that any modifications made to the code, when used to provide a service over a network, must also be released under the AGPLv3.
+
+- **Commercial License**: See [LICENSE-COMMERCIAL](./LICENSE-COMMERCIAL.md)  
+  For organizations or individuals who wish to integrate this software into proprietary products or services without being bound by the AGPLv3's copyleft requirements (e.g., keeping modifications private), a commercial license is available.
+
+
+<div align="center">
+
+<a href="https://github.com/ModalityDance/PalmClaw">
+  <img src="https://img.shields.io/badge/Star%20on%20GitHub-181717?style=for-the-badge&logo=github&logoColor=white" alt="Star on GitHub" />
+</a>
+
+<a href="https://github.com/ModalityDance/PalmClaw/issues">
+  <img src="https://img.shields.io/badge/Report%20Issues-e74c3c?style=for-the-badge&logo=github" alt="Report Issues" />
+</a>
+
+<a href="https://github.com/ModalityDance/PalmClaw/discussions">
+  <img src="https://img.shields.io/badge/Discussions-20c997?style=for-the-badge&logo=github" alt="Discussions" />
+</a>
+
+</div>
+
+<div align="center">
+
+Thanks for visiting PalmClaw! <a href="https://visitor-badge.laobi.icu"><img src="https://visitor-badge.laobi.icu/badge?page_id=ModalityDance.PalmClaw&left_text=visits" alt="Visitor Count" />
+</a>
+
+</div>
+
+

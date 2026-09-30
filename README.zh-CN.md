@@ -1,0 +1,426 @@
+﻿<a name="readme-top"></a>
+
+<p align="right"><a href="./README.md">English</a></p>
+
+<div align="center">
+  <h1>
+    <img src="./docs/assets/brand/PalmClaw-removebg-black.png#gh-light-mode-only" alt="PalmClaw 线性 Logo（浅色模式）" width="56" />
+    <img src="./docs/assets/brand/PalmClaw-removebg-preview.png#gh-dark-mode-only" alt="PalmClaw 线性 Logo（深色模式）" width="56" />
+    PalmClaw
+  </h1>
+  <p>原生运行在 Android 手机上的 AI Agent 框架。</p>
+</div>
+
+<div align="center">
+  <a href="https://modalitydance.github.io/PalmClaw/">
+    <img src="https://img.shields.io/badge/%E9%A1%B9%E7%9B%AE-%E4%B8%BB%E9%A1%B5-0A84FF?style=for-the-badge" alt="项目主页">
+  </a>
+  <a href="https://arxiv.org/abs/2607.13027">
+    <img src="https://img.shields.io/badge/arXiv-2607.13027-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv 2607.13027">
+  </a>
+  <a href="https://huggingface.co/papers/2607.13027">
+    <img src="https://img.shields.io/badge/Hugging%20Face-Papers-FFD21E?style=for-the-badge" alt="Hugging Face Papers">
+  </a>
+  <a href="https://github.com/ModalityDance/PalmClaw/releases/latest/download/app-release.apk">
+    <img src="https://img.shields.io/badge/%E4%B8%8B%E8%BD%BD-APK-f39c12?style=for-the-badge&logo=android&logoColor=white" alt="下载 APK">
+  </a>
+  <a href="./docs/assets/site/weixingroup.jpg">
+    <img src="https://img.shields.io/badge/%E5%BE%AE%E4%BF%A1-%E5%BC%80%E6%BA%90%E4%BA%A4%E6%B5%81%E7%BE%A4-07C160?style=for-the-badge&logo=wechat&logoColor=white" alt="微信开源交流群">
+  </a>
+  <a href="https://github.com/ModalityDance/PalmClaw/releases">
+    <img src="https://img.shields.io/github/downloads/ModalityDance/PalmClaw/total?style=for-the-badge&label=%E7%B4%AF%E8%AE%A1%E4%B8%8B%E8%BD%BD" alt="累计下载">
+  </a>
+  <img src="https://img.shields.io/badge/%E6%B5%8B%E8%AF%95-769-2ecc71?style=for-the-badge" alt="769 个测试">
+  <img src="https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Android-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android">
+  <img src="https://img.shields.io/badge/%E8%AF%AD%E8%A8%80-Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white" alt="Kotlin">
+</div>
+
+<p align="center"><strong>只想直接下载？<a href="#quick-start-download">跳到快速开始</a></strong></p>
+
+<a name="overview"></a>
+## 项目简介
+
+PalmClaw 是一个受 [OpenClaw](https://github.com/openclaw/openclaw) 启发的开源 Agent 框架，可以直接运行在 Android 手机上，无需额外的 PC。
+
+它在设备端管理会话、上下文、记忆、Skills、工具和 Agent loop，模型推理由用户配置的 LLM API 提供。
+
+- 直接在 Android App 内运行和配置 Agent。
+- 通过结构化设备工具直接使用手机能力。
+- 通过 schema、权限、用户确认和 workspace 边界控制设备操作。
+
+<a name="key-features"></a>
+## 核心特性
+
+- **端侧 Agent 框架**  
+  在手机端运行会话、上下文管理、Memory、Skills、工具和 Agent loop。
+
+- **结构化设备工具**  
+  通过类型明确的操作和结构化结果使用文件、个人数据、硬件、Web、通信和自动化能力。
+
+- **明确的执行边界**  
+  在执行设备操作前检查 schema、Android 权限、用户确认和 workspace 路径。
+
+- **持久化会话与上下文**  
+  跨轮次保留对话历史、工具轨迹、附件、会话 workspace 和可复用记忆。
+
+- **渠道与自动化**  
+  从本地聊天或远程渠道接收任务，并通过 Cron、Heartbeat 和常驻模式执行定时工作。
+
+- **可扩展接入**  
+  支持内置或自定义 LLM Provider、MCP Server，以及内置或用户安装的 Skills。
+
+
+<a name="demos"></a>
+## 演示
+
+<div align="center">
+  <table width="100%">
+    <tr>
+      <td align="center"><img src="./docs/assets/site/demos/start.gif" alt="初始配置演示" width="96%"></td>
+      <td align="center"><img src="./docs/assets/site/demos/func.gif" alt="核心功能演示" width="96%"></td>
+      <td align="center"><img src="./docs/assets/site/demos/tool.gif" alt="工具使用演示" width="96%"></td>
+      <td align="center"><img src="./docs/assets/site/demos/channel.gif" alt="渠道配置演示" width="96%"></td>
+    </tr>
+    <tr>
+      <td align="center"><sub>初始配置</sub></td>
+      <td align="center"><sub>核心功能</sub></td>
+      <td align="center"><sub>工具使用</sub></td>
+      <td align="center"><sub>渠道配置</sub></td>
+    </tr>
+  </table>
+</div>
+
+
+<a name="news"></a>
+## 最新动态
+
+- 🚀 **[2026.08.26] v0.3.1 原生工具、运行时可靠性与 MCP 更新：** 完善 workspace 文件与原生工具，加强 Cron、常驻模式、渠道和 MCP，改进 Provider 端点兼容性与聊天响应时序，并将测试覆盖扩展至 769 个。
+- 🎉 **[2026.08.23] 论文录用！** 很高兴与大家分享，[PalmClaw: A Native On-Device Agent Framework for Mobile Phones](https://arxiv.org/abs/2607.13027) 已被 EMNLP 2026 System Demonstrations 接收！
+- 📄 **[2026.07.16] 论文发布：** 我们的论文 [PalmClaw: A Native On-Device Agent Framework for Mobile Phones](https://arxiv.org/abs/2607.13027) 现已发布于 arXiv。
+- **[2026.06.16] v0.2.1 Runtime、聊天体验与 Skills 更新：** 统一 gateway runtime，优化按会话处理和聊天滚动体验，加入 ClawHub 浏览与安装前审查，拆分主要 UI 状态，完善渠道/工具设置，并将测试覆盖提升到 306 个。
+- **[2026.04.06] v0.1.5 UI 重构、设置页与权限更新：** 重构了主要 UI 结构，优化了设置页体验，增加统一权限管理，修复非用户新建 session 的调试问题，并修复本地文件权限与 MCP 连接权限问题。
+- **[2026.03.28] v0.1.4 渠道、界面与自动更新：** 优化渠道连接流程与稳定性，调整部分 UI 与结构，补充部分单元测试，并新增自动检查更新与下载能力。
+- **[2026.03.25] v0.1.3 自定义 Provider 与自动识别更新：** 支持自定义 Provider 名称，优化接口自动识别，并记忆成功的解析结果。
+- **[2026.03.24] v0.1.2 Provider 与设置体验更新：** 新增火山引擎、BytePlus、Mistral 预设，优化模型配置，并改进设置页体验。
+- **[2026.03.21] v0.1.1 中文文档与体验更新：** 新增中文 README，补充中文错误提示，并修复 MiniMax API 端点。
+- **[2026.03.16] 首次发布：** PalmClaw **v0.1.0** 已正式上线。
+
+<a name="roadmap"></a>
+### 路线图
+
+- [x] 提升工程化质量，并补充更多测试覆盖。
+  - [x] 增加进程级唯一 runtime owner，将常驻模式收敛为前台服务保活壳。
+  - [x] 增加按会话隔离的 turn 调度，避免一个会话里的长任务阻塞所有会话。
+  - [x] 增加轻量 composition root，并把主要 UI 状态拆成更聚焦的 slice。
+  - [x] 覆盖 769 个单元/仪器测试，涉及 runtime、UI 状态、工具、渠道、存储、provider 和 skills。
+- [x] 完善工具能力。
+  - [x] 增加可视化工具管理页面。
+  - [x] 增加可配置的 web search provider。
+  - [x] 工具开关即时生效，不需要额外保存。
+- [x] 完善 Skill 能力。
+  - [x] 增加已安装/本地技能的可视化管理。
+  - [x] 接入 ClawHub 浏览、搜索、下载和安装前审查。
+- [x] 优化聊天和设置页体验。
+  - [x] 增加轻量启动页，用于预加载必要本地状态。
+  - [x] 优化会话切换、最近消息加载、历史分页和滚动稳定性。
+  - [x] 设置页进入和退出详情页时保留当前位置。
+- [ ] 继续完善 Skill 能力。
+  - [ ] 增加可视化 Skill 编辑能力。
+  - [ ] 支持 `desktop skill -> mobile-ready skill` 转换能力。
+- [ ] 接入更多渠道。
+- [ ] 扩展更多 Android 原生能力。
+  - [ ] 通过无障碍与录屏实现自动化软件控制。
+  - [ ] 增加更多本地应用接入。
+  - [ ] 增加可选的 Termux Bridge，通过用户已安装的 Termux 执行本地命令，并提供显式开启、超时、输出限制和高风险操作确认。
+- [ ] 继续改进 harness 工程与 Agent loop（以 Claude Code 为参考）。
+
+
+<a name="table-of-contents"></a>
+## 目录
+
+- [项目简介](#项目简介)
+- [核心特性](#核心特性)
+- [演示](#演示)
+- [最新动态](#最新动态)
+  - [路线图](#路线图)
+- [目录](#目录)
+- [快速开始](#快速开始)
+  - [普通用户](#普通用户)
+  - [开发者](#开发者)
+- [渠道配置](#渠道配置)
+- [PalmClaw 如何工作](#palmclaw-如何工作)
+- [仓库结构](#仓库结构)
+- [社区](#社区)
+- [引用](#引用)
+- [许可证](#许可证)
+
+<a name="quick-start"></a>
+<a name="quick-start-download"></a>
+## 快速开始
+
+<a name="for-normal-users"></a>
+### 普通用户
+
+1. 在 [Releases 页面](https://github.com/ModalityDance/PalmClaw/releases) 下载最新 APK。
+2. 在你的 Android 手机上安装 APK。
+3. 打开 PalmClaw，跟随应用内的新手引导完成配置。
+4. 完成 provider 设置后，就可以先从本地会话开始聊天。
+
+<div align="center">
+  <a href="https://github.com/ModalityDance/PalmClaw/releases/latest/download/app-release.apk">
+    <img src="./docs/assets/site/app-download-qr.png" alt="扫码下载 PalmClaw APK" width="128" style="vertical-align: middle; border-radius: 4px;" />
+  </a>
+  &nbsp;&nbsp;
+  <a href="./docs/assets/site/weixingroup.jpg">
+    <img src="./docs/assets/site/weixingroup.jpg" alt="加入 PalmClaw 微信开源交流群" width="128" style="vertical-align: middle; border-radius: 4px;" />
+  </a>
+  <br />
+  <sub>扫码下载最新 APK</sub>
+  <sub>&nbsp;&nbsp;|&nbsp;&nbsp;</sub>
+  <sub>扫码加入开源交流微信群</sub>
+</div>
+
+> [!IMPORTANT]
+> PalmClaw 默认不提供托管模型服务。首次使用时，你需要配置自己的 provider API Key。
+
+<a name="for-developers"></a>
+### 开发者
+
+1. 安装 Android Studio 和 JDK 17。
+2. 克隆仓库：
+
+```bash
+git clone https://github.com/ModalityDance/PalmClaw.git
+cd PalmClaw
+```
+
+3. 用 Android Studio 打开项目，并等待 Gradle 同步完成。
+4. 确认 `local.properties` 已正确指向你的 Android SDK 路径。
+5. 在真机或模拟器上运行应用。
+
+> [!NOTE]
+> `local.properties` 是本机相关配置，不应提交到仓库。
+
+<a name="channels-configuration"></a>
+## 渠道配置
+
+PalmClaw 当前支持以下渠道：
+
+<details>
+<summary><strong>Telegram</strong></summary>
+
+1. 将 `Channel` 设置为 `Telegram`。
+2. 填写 `Telegram Bot Token` 并保存。
+3. 在 Telegram 里先给你的 bot 发一条消息。
+4. 点击 `Detect Chats`。
+5. 选择检测到的会话，然后保存绑定。
+
+</details>
+
+<details>
+<summary><strong>Discord</strong></summary>
+
+1. 将 `Channel` 设置为 `Discord`。
+2. 填写 `Discord Bot Token`。
+3. 设置目标 `Discord Channel ID`。
+4. 选择回复模式（`mention` 或 `open`），如有需要可额外设置允许的用户 ID。
+5. 保存绑定。
+
+> [!TIP]
+> 先把 bot 邀请到目标服务器/频道。
+>
+> 如果使用 `mention` 模式，需要先 @ 一次 bot，才能在 guild channel 中触发回复。
+
+</details>
+
+<details>
+<summary><strong>Slack</strong></summary>
+
+1. 将 `Channel` 设置为 `Slack`。
+2. 填写 `Slack App Token (xapp...)` 和 `Slack Bot Token (xoxb...)`。
+3. 设置目标 `Slack Channel ID`。
+4. 选择回复模式（`mention` 或 `open`），如有需要可额外设置允许的用户 ID。
+5. 保存绑定。
+
+> [!IMPORTANT]
+> Slack 需要先满足以下前置条件：
+>
+> - 已开启 Socket Mode
+> - App token 具备 `connections:write`
+> - Bot token 具备所需的消息/回复权限范围
+
+</details>
+
+<details>
+<summary><strong>Feishu （飞书）</strong></summary>
+
+1. 将 `Channel` 设置为 `Feishu`。
+2. 填写 `Feishu App ID` 和 `Feishu App Secret` 后，先在 PalmClaw 本地保存一次。
+3. 在飞书开放平台里确认已经启用 Bot 能力，然后在 `事件与回调` 中选择“长连接”，再添加 `im.message.receive_v1`。
+4. 在 `权限管理` 里添加 `im:message`（发送消息）和 `im:message.p2p_msg:readonly`（接收消息）。如果你是在群里通过 `@机器人` 测试，还需要额外添加 `im:message.group_at_msg:readonly`。
+5. 发布应用，在飞书中打开它，并在 PalmClaw 保持运行时确认长连接配置。
+6. 从飞书给机器人发一条消息。
+7. 点击 `Detect Chats`。
+8. 选择检测到的目标（私聊用 `open_id`，群聊用 `chat_id`），然后再次保存。
+9. 可选：设置 `Allowed Open IDs`。
+
+> 如果本地发消息能到飞书，但飞书发消息进不来，通常就是接收权限、事件订阅、发布并打开应用，或长连接确认步骤还没完成。
+
+</details>
+
+<details>
+<summary><strong>Email （邮箱）</strong></summary>
+
+1. 将 `Channel` 设置为 `Email`。
+2. 打开授权开关。
+3. 填写 IMAP 设置：host、port、username、password。
+4. 填写 SMTP 设置：host、port、username、password、from address。
+5. 先保存一次，以启动邮箱轮询。
+6. 从目标发件人向这个邮箱发送一封邮件。
+7. 点击 `Detect Senders`。
+8. 选择发件人后再次保存。
+9. 可选：打开或关闭自动回复。
+
+</details>
+
+<details>
+<summary><strong>WeCom （企业微信）</strong></summary>
+
+1. 将 `Channel` 设置为 `WeCom`。
+2. 填写 `WeCom Bot ID` 和 `WeCom Secret`。
+3. 先保存一次，以启动长连接。
+4. 从企微给 bot 发一条消息。
+5. 点击 `Detect Chats`。
+6. 选择检测到的目标后再次保存。
+7. 可选：设置 `Allowed User IDs`。
+
+</details>
+
+> [!NOTE]
+> 任意渠道都建议按下面的顺序来配置：
+>
+> 1. 先打开目标会话。
+> 2. 进入 `Session Settings` -> `Channels & Configuration`。
+> 3. 选择渠道类型，并按界面提示完成配置。
+
+<a name="how-palmclaw-works"></a>
+## PalmClaw 如何工作
+
+<div align="center">
+  <img src="./docs/assets/site/architecture.png" alt="PalmClaw 架构概览" width="800">
+</div>
+
+- **消息输入**：输入既可以来自本地聊天，也可以来自已连接的渠道。
+- **Agent loop**：LLM 负责决策，需要时调用工具，然后生成回复。
+- **上下文**：memory 与 skills 共同为每一轮提供引导。
+- **消息输出**：结果会写回当前会话，并发送回对应渠道。
+
+<a name="repository-structure"></a>
+## 仓库结构
+
+```text
+PalmClaw/
+├─ app/
+│  ├─ src/main/java/com/palmclaw/
+│  │  ├─ agent/             # 上下文构建与 Agent loop
+│  │  ├─ runtime/           # Runtime 所有权、控制、常驻模式与自动化
+│  │  ├─ tools/             # 内置工具与 Android 平台 Gateway
+│  │  ├─ mcp/               # MCP 传输、生命周期与能力接入
+│  │  ├─ channels/          # 远程消息渠道 Adapter
+│  │  ├─ providers/         # LLM 协议与端点解析
+│  │  ├─ storage/           # Room 数据库与 Repository
+│  │  ├─ workspace/         # 会话 workspace 与路径边界
+│  │  ├─ memory/            # 持久化 Agent 记忆
+│  │  ├─ skills/            # Skill 加载与兼容性检查
+│  │  ├─ ui/                # Compose UI 与 UI Coordinator
+│  │  └─ ...                # config、cron、heartbeat、attachments 与 bus
+│  ├─ src/main/assets/      # 模板与内置 Skills
+│  ├─ src/test/             # JVM 单元测试
+│  └─ src/androidTest/      # Android 仪器测试
+├─ docs/
+│  ├─ engineering/          # 架构、路线图与测试说明
+│  └─ assets/               # 品牌、官网与宣传资源
+├─ gradle/                  # Gradle Wrapper 文件
+├─ README.md
+└─ README.zh-CN.md
+```
+
+<a name="community"></a>
+## 社区
+
+欢迎研究者、开发者，以及所有关注移动端 AI 实践的朋友加入 PalmClaw 社区。
+
+
+<div align="center">
+
+**感谢所有贡献者。**
+
+<a href="https://github.com/ModalityDance/PalmClaw/contributors">
+  <img src="https://contrib.rocks/image?repo=ModalityDance/PalmClaw" alt="贡献者" />
+</a>
+
+<br/><br/>
+
+<a href="https://www.star-history.com/?repos=ModalityDance%2FPalmClaw&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ModalityDance/PalmClaw&type=date&theme=dark&legend=top-left&sealed_token=ts2i77HAoVe3yV1ykgAXYA_NejEbBqFQa9T_xNJ3E0bQcypOJFcM3VAR8rFiZZmptsxIqporh2ygxWZkCzlr78uIT9WxHIbHT3BBAjTmSAeVgcUDF1yFxw" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ModalityDance/PalmClaw&type=date&legend=top-left&sealed_token=ts2i77HAoVe3yV1ykgAXYA_NejEbBqFQa9T_xNJ3E0bQcypOJFcM3VAR8rFiZZmptsxIqporh2ygxWZkCzlr78uIT9WxHIbHT3BBAjTmSAeVgcUDF1yFxw" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=ModalityDance/PalmClaw&type=date&legend=top-left&sealed_token=ts2i77HAoVe3yV1ykgAXYA_NejEbBqFQa9T_xNJ3E0bQcypOJFcM3VAR8rFiZZmptsxIqporh2ygxWZkCzlr78uIT9WxHIbHT3BBAjTmSAeVgcUDF1yFxw" />
+ </picture>
+</a>
+
+</div>
+
+
+<a name="citation"></a>
+## 引用
+
+如果 PalmClaw 对你的研究有帮助，请引用我们的论文：
+
+```bibtex
+@misc{cai2026palmclawnativeondeviceagent,
+      title={PalmClaw: A Native On-Device Agent Framework for Mobile Phones},
+      author={Hongru Cai and Yongqi Li and Ran Wei and Wenjie Li},
+      year={2026},
+      eprint={2607.13027},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2607.13027},
+}
+```
+
+
+<a name="license"></a>
+## 许可证
+
+本项目采用**双许可证模式**：
+
+- **开源许可证**：见 [LICENSE](LICENSE)  
+  这是项目默认采用的许可证。它要求任何基于本项目代码进行的修改，只要被用于通过网络提供服务，也必须按照 AGPLv3 开源发布。
+
+- **商业许可证**：见 [LICENSE-COMMERCIAL](./LICENSE-COMMERCIAL.md)  
+  如果组织或个人希望将本软件集成进闭源产品或服务中，并且不受 AGPLv3 copyleft 要求约束（例如不公开修改内容），可以选择商业许可证。
+
+
+<div align="center">
+
+<a href="https://github.com/ModalityDance/PalmClaw">
+  <img src="https://img.shields.io/badge/GitHub-%E7%82%B9%E4%B8%AA%20Star-181717?style=for-the-badge&logo=github&logoColor=white" alt="在 GitHub 点 Star" />
+</a>
+
+<a href="https://github.com/ModalityDance/PalmClaw/issues">
+  <img src="https://img.shields.io/badge/%E5%8F%8D%E9%A6%88-%E9%97%AE%E9%A2%98-e74c3c?style=for-the-badge&logo=github" alt="反馈问题" />
+</a>
+
+<a href="https://github.com/ModalityDance/PalmClaw/discussions">
+  <img src="https://img.shields.io/badge/%E5%8F%82%E4%B8%8E-%E8%AE%A8%E8%AE%BA-20c997?style=for-the-badge&logo=github" alt="参与讨论" />
+</a>
+
+</div>
+
+<div align="center">
+
+感谢访问 PalmClaw！<a href="https://visitor-badge.laobi.icu"><img src="https://visitor-badge.laobi.icu/badge?page_id=ModalityDance.PalmClaw&left_text=visits" alt="访问量" />
+</a>
+
+</div>
