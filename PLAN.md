@@ -112,6 +112,18 @@ Settings → Provider → **Duck.ai (free)** — بدون API Key، بدون ل�
 | فقط gpt-5.6-luna بدون لاگین در دسترس است (sol/terra/gpt-5.1-thinking/gpt-4o-mini → 404) | لیست مدل‌ها به همان محدود شد | ✅ |
 | پاسخ خالی مدل | retry ملایم + در نهایت fallback | ✅ |
 
+## فاز ۳ — Keep-alive بکگراند (تغییر کوچک، فایل‌های دست‌نخورده از قبل)
+
+| تغییر | فایل | توضیح |
+|---|---|---|
+| **جدید** | `runtime/AgentKeepAlive.kt` | object (شمارنده‌ی busy + linger ۹۰s + debounce) + `AgentKeepAliveService` (FGS specialUse + WakeLock + پیل شناور قابل‌درگ «● PalmClaw» با tap→بازگشت به چت) + `ensurePermissions` (overlay + battery-exempt + POST_NOTIFICATIONS، یک‌بار per install) |
+| هوک | `AdaptiveLlmProvider` | chat()/chatStream() → مرزهای busy (تنها مسیر همه‌ی LLM call ها از همین می‌گذرد) |
+| هوک | `MainActivity.onCreate` | `ensurePermissions` یک‌بار اجرا |
+| فیکس | `AgentAccessibilityService` | `bestRoot()`: اگر پنجره‌ی فعال خود PalmClaw بود، از لیست windows ریشه‌ی اپ دیگر انتخاب می‌شود → get_ui_tree دیگر UI خود اپ را کپچر نمی‌کند |
+| منیفست | سرویس جدید | foregroundServiceType=specialUse (پرمیشن‌ها از قبل موجود بودند) |
+
+رفتار: اپ در بکگراند + ایجنت مشغول → نوتیف + پیل شناور + ویک‌لاک؛ ایجنت idle ≥۹۰s → همه‌چیز خودش خاموش می‌شود.
+
 ## نکته‌ی لایسنس
 
 PalmClaw تحت **AGPL-3.0** و apkmcp تحت **MIT** است — استفاده‌ی شخصی آزاد؛ اگر APK را منتشر کردی سورس را هم باید در دسترس بگذاری.

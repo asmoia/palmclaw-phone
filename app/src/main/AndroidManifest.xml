@@ -76,6 +76,18 @@
                 android:value="User-enabled persistent on-device agent gateway that maintains configured remote channel connections and processes incoming user requests." />
         </service>
 
+        <!-- Keeps an in-flight agent run alive while the user is in other apps
+             (foreground notification + wake lock + optional floating pill). -->
+        <service
+            android:name=".runtime.AgentKeepAliveService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps an active on-device agent conversation alive while the user works in other apps; shows a small status overlay." />
+        </service>
+
         <receiver
             android:name=".cron.CronAlarmReceiver"
             android:enabled="true"

@@ -1,7 +1,10 @@
 package com.palmclaw.providers
 
 import com.palmclaw.config.AppConfig
+import com.palmclaw.runtime.AgentKeepAlive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import okhttp3.OkHttpClient
@@ -14,34 +17,47 @@ internal class AdaptiveLlmProvider(
 ) : LlmProvider {
 
     override suspend fun chat(messages: List<ChatMessage>, toolsSpec: List<ToolSpec>): LlmResponse {
-        val targets = plannedTargets()
-        var lastFailure: Throwable? = null
-        for ((index, target) in targets.withIndex()) {
-            try {
-                val response = createDelegate(target).chat(messages, toolsSpec)
-                rememberSuccessfulTarget(target)
-                return response
-            } catch (t: Throwable) {
-                lastFailure = t
-                val nextTarget = targets.getOrNull(index + 1)
-                if (nextTarget == null || !ProviderEndpointRetryPolicy.shouldTryNext(
-                        profile = profile,
-                        current = target,
-                        next = nextTarget,
-                        failure = t
-                    )
-                ) {
-                    throw t
+        AgentKeepAlive.chatStarted()
+        try {
+            val targets = plannedTargets()
+            var lastFailure: Throwable? = null
+            for ((index, target) in targets.withIndex()) {
+                try {
+                    val response = createDelegate(target).chat(messages, toolsSpec)
+                    rememberSuccessfulTarget(target)
+                    return response
+                } catch (t: Throwable) {
+                    lastFailure = t
+                    val nextTarget = targets.getOrNull(index + 1)
+                    if (nextTarget == null || !ProviderEndpointRetryPolicy.shouldTryNext(
+                            profile = profile,
+                            current = target,
+                            next = nextTarget,
+                            failure = t
+                        )
+                    ) {
+                        throw t
+                    }
                 }
             }
+            throw lastFailure ?: IOException("${profile.title} request failed.")
+        } finally {
+            AgentKeepAlive.chatFinished()
         }
-        throw lastFailure ?: IOException("${profile.title} request failed.")
     }
 
     override fun chatStream(messages: List<ChatMessage>, toolsSpec: List<ToolSpec>): Flow<LlmStreamEvent> {
         val target = plannedTargets().firstOrNull()
             ?: throw IllegalStateException("No usable endpoint target resolved.")
-        return createDelegate(target).chatStream(messages, toolsSpec)
+        val upstream = createDelegate(target).chatStream(messages, toolsSpec)
+        return flow {
+            AgentKeepAlive.chatStarted()
+            try {
+                emitAll(upstream)
+            } finally {
+                AgentKeepAlive.chatFinished()
+            }
+        }
     }
 
     private fun plannedTargets(): List<ProviderExecutionTarget> {

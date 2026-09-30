@@ -38,6 +38,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.palmclaw.runtime.AgentKeepAlive.ensurePermissions(this)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
             val vm: ChatViewModel = viewModel(factory = ChatViewModel.factory(application))

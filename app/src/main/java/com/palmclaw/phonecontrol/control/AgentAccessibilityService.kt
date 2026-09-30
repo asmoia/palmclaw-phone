@@ -49,8 +49,25 @@ class AgentAccessibilityService : AccessibilityService() {
         null
     }
 
+    /**
+     * Best root for screen reading: if the ACTIVE window is PalmClaw itself
+     * (floating window / split screen / our overlay pill), fall back to the
+     * most relevant OTHER window so the agent sees the app it is working on,
+     * not our own chat UI.
+     */
+    fun bestRoot(): AccessibilityNodeInfo? {
+        val own = packageName
+        val active = rootNode()
+        if (active == null || own == null || active.packageName != own) return active
+        val wins = try { windows } catch (t: Throwable) { emptyList() }
+        val candidates = wins
+            .mapNotNull { w -> runCatching { w.root }.getOrNull() }
+            .filter { it.packageName != null && it.packageName != own }
+        return candidates.firstOrNull { it.isVisibleToUser } ?: candidates.firstOrNull() ?: active
+    }
+
     fun currentPackage(): String? = try {
-        rootInActiveWindow?.packageName?.toString()
+        bestRoot()?.packageName?.toString()
     } catch (t: Throwable) {
         null
     }
@@ -60,7 +77,7 @@ class AgentAccessibilityService : AccessibilityService() {
         return dm.widthPixels to dm.heightPixels
     }
 
-    fun uiTree(maxNodes: Int = 300): String = UiTreeReader.dump(rootNode(), maxNodes)
+    fun uiTree(maxNodes: Int = 300): String = UiTreeReader.dump(bestRoot(), maxNodes)
 
     // ── 手势 ────────────────────────────────────────────────
 
