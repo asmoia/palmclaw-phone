@@ -9,7 +9,6 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.getCompletionExceptionOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
@@ -74,16 +73,22 @@ object DuckWebViewBridge {
 
     // ── WebView lifecycle ─────────────────────────────────────────────────────
 
-    private fun ensureReady(): CompletableDeferred<Unit> {
-        val existing = readyLock
-        if (existing != null && existing.getCompletionExceptionOrNull() == null) return existing
+    /** Fails a readiness latch and clears it so the next call rebuilds the WebView. */
+    private fun failReady(latch: CompletableDeferred<Unit>, error: Throwable) {
         synchronized(this) {
-            val again = readyLock
-            if (again != null && again.getCompletionExceptionOrNull() == null) return again
+            if (readyLock === latch) readyLock = null
+            latch.completeExceptionally(error)
+        }
+    }
+
+    private fun ensureReady(): CompletableDeferred<Unit> {
+        synchronized(this) {
+            readyLock?.let { return it } // pending or successfully completed
             val latch = CompletableDeferred<Unit>()
             readyLock = latch
             val ctx = appContext
                 ?: return latch.apply {
+                    readyLock = null
                     completeExceptionally(IllegalStateException("DuckWebViewBridge not initialized"))
                 }
             val myGen = ++generation
@@ -107,11 +112,11 @@ object DuckWebViewBridge {
                     wv.loadUrl(DUCK_URL)
                     mainHandler.postDelayed({
                         if (!latch.isCompleted) {
-                            latch.completeExceptionally(IllegalStateException("duck.ai page failed to load (timeout)"))
+                            failReady(latch, IllegalStateException("duck.ai page failed to load (timeout)"))
                         }
                     }, PAGE_LOAD_TIMEOUT_MS)
                 } catch (t: Throwable) {
-                    latch.completeExceptionally(t)
+                    failReady(latch, t)
                 }
             }
             // note: `myGen` captured for future multi-generation checks
