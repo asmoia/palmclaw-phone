@@ -124,6 +124,19 @@ Settings → Provider → **Duck.ai (free)** — بدون API Key، بدون ل�
 
 رفتار: اپ در بکگراند + ایجنت مشغول → نوتیف + پیل شناور + ویک‌لاک؛ ایجنت idle ≥۹۰s → همه‌چیز خودش خاموش می‌شود.
 
+## فاز ۳.۱ — ریشه‌یابی واقعی مشکل بکگراند
+
+**ریشه‌ی اصلی:** خود PalmClaw در `onAppBackgrounded()` → `releaseGatewayOwnership()` → `stopGateway()` — کل رانتایم ایجنت را با بکگراند شدن اپ می‌ایستاد! (دلیل اثرگذاری ترفند پنجره‌ی شناور: activity استاپ نمی‌شد → release نمی‌شد.)
+
+فیکس‌ها:
+| تغییر | توضیح |
+|---|---|
+| `RuntimeApplicationService` | اگر ایجنت busy باشد (یا ≤۹۰s از آخرین call) release به تعویق می‌افتد؛ پس از idle شدن توسط سرویس، `onAgentIdleWhileBackgrounded()` آزادسازی را انجام می‌دهد |
+| `MainActivity` | `AgentKeepAlive.setVisible(true/false)` در onStart/onStop وصل شد (باگ قبلی: پیل شناور هرگز نمایش داده نمی‌شد) |
+| `AgentKeepAliveService` | در پایان کار ایجنت، release معوق را از طریق AppContainer انجام می‌دهد |
+
+نتیجه: رفتار بکگراند = همان ترفند پنجره‌ی شناور، بدون نیاز به نگه‌داشتن اپ باز.
+
 ## نکته‌ی لایسنس
 
 PalmClaw تحت **AGPL-3.0** و apkmcp تحت **MIT** است — استفاده‌ی شخصی آزاد؛ اگر APK را منتشر کردی سورس را هم باید در دسترس بگذاری.

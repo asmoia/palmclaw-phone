@@ -26,11 +26,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        com.palmclaw.runtime.AgentKeepAlive.setVisible(true)
         appContainer.setAppForegrounded(true)
     }
 
     override fun onStop() {
         if (!isChangingConfigurations) {
+            com.palmclaw.runtime.AgentKeepAlive.setVisible(false)
             appContainer.setAppForegrounded(false)
         }
         super.onStop()

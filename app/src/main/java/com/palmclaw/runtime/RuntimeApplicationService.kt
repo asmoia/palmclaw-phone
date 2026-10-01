@@ -120,7 +120,15 @@ class RuntimeApplicationService internal constructor(
 
     fun isAlwaysOnEnabled(): Boolean = modeConfigGateway.getAlwaysOnConfig().enabled
 
+    /**
+     * True when the app went to the background while the agent was mid-run:
+     * the gateway release is deferred until the run finishes (see
+     * [onAgentIdleWhileBackgrounded]) so background agent runs survive.
+     */
+    private var backgroundReleasePending = false
+
     suspend fun onAppForegrounded() {
+        backgroundReleasePending = false
         normalRuntimeGateway.acquireGatewayOwnership()
         try {
             alwaysOnControl.reconcile(AlwaysOnTrigger.APP_FOREGROUND)
@@ -140,7 +148,22 @@ class RuntimeApplicationService internal constructor(
     }
 
     suspend fun onAppBackgrounded() {
+        // Keep the gateway (and the running agent loop) alive while the agent
+        // is busy; PalmClaw would otherwise stop the runtime the moment the
+        // UI goes to the background. AgentKeepAliveService triggers the
+        // deferred release once the agent has been idle for a while.
+        if (AgentKeepAlive.isBusy()) {
+            backgroundReleasePending = true
+            return
+        }
         normalRuntimeGateway.releaseGatewayOwnership()
+    }
+
+    internal suspend fun onAgentIdleWhileBackgrounded() {
+        if (backgroundReleasePending && !AgentKeepAlive.appVisible()) {
+            backgroundReleasePending = false
+            normalRuntimeGateway.releaseGatewayOwnership()
+        }
     }
 
     suspend fun startGatewayIfEnabled() {

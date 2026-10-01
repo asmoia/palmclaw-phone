@@ -28,7 +28,13 @@ import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import com.palmclaw.AppContainer
 import com.palmclaw.ui.MainActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -159,6 +165,7 @@ object AgentKeepAlive {
 class AgentKeepAliveService : Service() {
 
     private val main = Handler(Looper.getMainLooper())
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var overlay: View? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -187,6 +194,16 @@ class AgentKeepAliveService : Service() {
     /** Self-stop when the agent has been idle past the linger window. */
     private fun recheck() {
         if (!AgentKeepAlive.isBusy()) {
+            // Agent finished while the app is backgrounded → perform the
+            // gateway release that onAppBackgrounded deferred.
+            serviceScope.launch {
+                runCatching {
+                    (applicationContext as? android.app.Application)
+                        ?.let { AppContainer.from(it) }
+                        ?.runtimeApplicationService
+                        ?.onAgentIdleWhileBackgrounded()
+                }
+            }
             stopSelf()
             return
         }
@@ -276,6 +293,7 @@ class AgentKeepAliveService : Service() {
 
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
+        serviceScope.cancel()
         overlay?.let {
             runCatching { (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(it) }
         }
